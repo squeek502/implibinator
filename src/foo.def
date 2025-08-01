@@ -1,0 +1,5 @@
+LIBRARY "foo.dll"
+EXPORTS
+foo
+bar
+baz DATA
