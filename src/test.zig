@@ -20,7 +20,7 @@ test "foo" {
 
     var alloc_writer: std.io.Writer.Allocating = .init(std.testing.allocator);
     defer alloc_writer.deinit();
-    try implib.writeCoffArchive(&alloc_writer.writer, members);
+    try implib.writeCoffArchive(std.testing.allocator, &alloc_writer.writer, members);
 
     // try std.fs.cwd().writeFile(.{
     //     .sub_path = "foo.zig.lib",
@@ -28,5 +28,5 @@ test "foo" {
     // });
 
     const expected = @embedFile("foo.lib");
-    try std.testing.expectEqualSlices(u8, expected[428..], (alloc_writer.getWritten())[8..]);
+    try std.testing.expectEqualSlices(u8, expected, (alloc_writer.getWritten()));
 }
