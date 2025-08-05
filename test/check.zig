@@ -8,7 +8,7 @@ pub fn main() !void {
     defer std.debug.assert(gpa.deinit() == .ok);
     const allocator = gpa.allocator();
 
-    var root_dir = try std.fs.cwd().openDir("test/x86_64-windows-gnu", .{ .iterate = true });
+    var root_dir = try std.fs.cwd().openDir("tmp/x86_64-windows-gnu", .{ .iterate = true });
     defer root_dir.close();
 
     var walker = try root_dir.walk(allocator);
@@ -45,14 +45,6 @@ fn check(allocator: std.mem.Allocator, input: [:0]const u8, expected_output: []c
 
     const members = try implib.getMembers(allocator, module_def, .X64);
     defer members.deinit();
-
-    for (members.list.items) |member| {
-        // TODO
-        if (member.name.len >= 16) {
-            std.debug.print(" TODO import with long names, skipping\n", .{});
-            return;
-        }
-    }
 
     var alloc_writer: std.io.Writer.Allocating = .init(allocator);
     defer alloc_writer.deinit();

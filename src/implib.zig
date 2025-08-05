@@ -38,18 +38,22 @@ pub fn writeCoffArchive(allocator: std.mem.Allocator, writer: *std.io.Writer, me
             num_symbols += 1;
         }
 
-        if (member.name.len >= 16) {
+        if (member.needsLongName()) {
             _ = try long_names.put(allocator, member.name);
         }
     }
 
     const first_linker_member_len = 4 + (4 * num_symbols) + string_table_len;
     const second_linker_member_len = 4 + (4 * members.list.items.len) + 4 + (2 * num_symbols) + string_table_len;
-    const first_member_offset = archive_start.len + archive_header_len + std.mem.alignForward(usize, first_linker_member_len, 2) + archive_header_len + std.mem.alignForward(usize, second_linker_member_len, 2);
+    const long_names_len_including_header_and_padding = blk: {
+        if (long_names.map.count() == 0) break :blk 0;
+        break :blk archive_header_len + std.mem.alignForward(usize, long_names.data.items.len, 2);
+    };
+    const first_member_offset = archive_start.len + archive_header_len + std.mem.alignForward(usize, first_linker_member_len, 2) + archive_header_len + std.mem.alignForward(usize, second_linker_member_len, 2) + long_names_len_including_header_and_padding;
 
     // TODO: Write 'first linker member'
     // https://learn.microsoft.com/en-us/windows/win32/debug/pe-format#first-linker-member
-    try writeArchiveMemberHeader(writer, "", first_linker_member_len, "0");
+    try writeArchiveMemberHeader(writer, .linker_member, first_linker_member_len, "0");
     try writer.writeInt(u32, @intCast(num_symbols), .big);
     for (symbol_to_member_index.values()) |member_i| {
         const offset = member_offsets[member_i];
@@ -63,7 +67,7 @@ pub fn writeCoffArchive(allocator: std.mem.Allocator, writer: *std.io.Writer, me
 
     // TODO: Write 'second linker member'
     // https://learn.microsoft.com/en-us/windows/win32/debug/pe-format#second-linker-member
-    try writeArchiveMemberHeader(writer, "", second_linker_member_len, "0");
+    try writeArchiveMemberHeader(writer, .linker_member, second_linker_member_len, "0");
     try writer.writeInt(u32, @intCast(members.list.items.len), .little);
     for (member_offsets) |offset| {
         try writer.writeInt(u32, @intCast(first_member_offset + offset), .little);
@@ -91,9 +95,20 @@ pub fn writeCoffArchive(allocator: std.mem.Allocator, writer: *std.io.Writer, me
 
     // TODO: Write longnames member (only if necessary)
     // https://learn.microsoft.com/en-us/windows/win32/debug/pe-format#longnames-member
+    if (long_names.data.items.len != 0) {
+        // TODO: LLVM writes this with the padding byte included, likely a bug/mistake?
+        const written_len = std.mem.alignForward(usize, long_names.data.items.len, 2);
+        try writeLongNamesMemberHeader(writer, written_len);
+        try writer.writeAll(long_names.data.items);
+        if (long_names.data.items.len % 2 != 0) try writer.writeByte(archive_pad_byte);
+    }
 
     for (members.list.items) |member| {
-        try writeArchiveMemberHeader(writer, member.name, member.bytes.len, "644");
+        const name: MemberName = if (member.needsLongName())
+            .{ .longname = long_names.getOffset(member.name).? }
+        else
+            .{ .name = member.name };
+        try writeArchiveMemberHeader(writer, name, member.bytes.len, "644");
         try writer.writeAll(member.bytes);
         if (member.bytes.len % 2 != 0) try writer.writeByte(archive_pad_byte);
     }
@@ -106,11 +121,41 @@ const archive_header_end = "`\n";
 const archive_pad_byte = '\n';
 const archive_header_len = 60;
 
-fn writeArchiveMemberHeader(writer: *std.io.Writer, name: []const u8, size: usize, mode: []const u8) !void {
-    try writer.writeAll(name);
-    try writer.writeByte('/');
-    try writer.splatByteAll(' ', 16 - (name.len + 1));
+const MemberName = union(enum) {
+    name: []const u8,
+    linker_member,
+    longnames_member,
+    longname: usize,
 
+    pub fn write(self: MemberName, writer: *std.io.Writer) !void {
+        switch (self) {
+            .name => |name| {
+                try writer.writeAll(name);
+                try writer.writeByte('/');
+                try writer.splatByteAll(' ', 16 - (name.len + 1));
+            },
+            .linker_member => {
+                try writer.writeAll("/               ");
+            },
+            .longnames_member => {
+                try writer.writeAll("//              ");
+            },
+            .longname => |offset| {
+                try writer.print("/{d: <15}", .{offset});
+            },
+        }
+    }
+};
+
+fn writeLongNamesMemberHeader(writer: *std.io.Writer, size: usize) !void {
+    try (MemberName{ .longnames_member = {} }).write(writer);
+    try writer.splatByteAll(' ', archive_header_len - 16 - 10 - archive_header_end.len);
+    try writer.print("{d: <10}", .{size});
+    try writer.writeAll(archive_header_end);
+}
+
+fn writeArchiveMemberHeader(writer: *std.io.Writer, name: MemberName, size: usize, mode: []const u8) !void {
+    try name.write(writer);
     try writer.writeAll("0           "); // date
     try writer.writeAll("0     "); // user id
     try writer.writeAll("0     "); // group id
@@ -130,6 +175,10 @@ pub const Members = struct {
 
         pub fn byteLenWithPadding(self: Member) usize {
             return std.mem.alignForward(usize, self.bytes.len, 2);
+        }
+
+        pub fn needsLongName(self: Member) bool {
+            return self.name.len >= 16;
         }
     };
 
