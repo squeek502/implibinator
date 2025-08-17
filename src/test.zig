@@ -28,5 +28,5 @@ fn check(input: [:0]const u8, expected: []const u8) !void {
     defer alloc_writer.deinit();
     try implib.writeCoffArchive(std.testing.allocator, &alloc_writer.writer, members);
 
-    try std.testing.expectEqualSlices(u8, expected, (alloc_writer.getWritten()));
+    try std.testing.expectEqualSlices(u8, expected, (alloc_writer.written()));
 }

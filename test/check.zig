@@ -50,5 +50,5 @@ fn check(allocator: std.mem.Allocator, input: [:0]const u8, expected_output: []c
     defer alloc_writer.deinit();
     try implib.writeCoffArchive(allocator, &alloc_writer.writer, members);
 
-    try std.testing.expectEqualSlices(u8, expected_output, alloc_writer.getWritten());
+    try std.testing.expectEqualSlices(u8, expected_output, alloc_writer.written());
 }

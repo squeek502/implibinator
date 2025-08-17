@@ -44,8 +44,8 @@ fn gen(allocator: std.mem.Allocator, full_path: []const u8, out_sub_dir_path: []
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    var argv = std.ArrayList([]const u8).init(arena);
-    try argv.appendSlice(&.{
+    var argv: std.ArrayList([]const u8) = .empty;
+    try argv.appendSlice(arena, &.{
         "zig4",
         "implib",
         "-outdir",
