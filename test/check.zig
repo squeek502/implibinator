@@ -8,7 +8,16 @@ pub fn main() !void {
     defer std.debug.assert(gpa.deinit() == .ok);
     const allocator = gpa.allocator();
 
-    var root_dir = try std.fs.cwd().openDir("tmp/x86_64-windows-gnu", .{ .iterate = true });
+    const args = try std.process.argsAlloc(allocator);
+    defer std.process.argsFree(allocator, args);
+
+    if (args.len < 2) {
+        std.debug.print("expected root dir for def files as first argument", .{});
+        std.process.exit(1);
+    }
+
+    const root_dir_path = args[1];
+    var root_dir = try std.fs.cwd().openDir(root_dir_path, .{ .iterate = true });
     defer root_dir.close();
 
     var walker = try root_dir.walk(allocator);
