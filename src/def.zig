@@ -1,7 +1,7 @@
 const std = @import("std");
 
 pub const ModuleDefinition = struct {
-    exports: std.ArrayListUnmanaged(Export) = .empty,
+    exports: std.ArrayList(Export) = .empty,
     name: ?[]const u8 = null,
     base_address: usize = 0,
     arena: std.heap.ArenaAllocator,

@@ -24,7 +24,7 @@ fn check(input: [:0]const u8, expected: []const u8) !void {
     const members = try implib.getMembers(std.testing.allocator, module_def, .X64);
     defer members.deinit();
 
-    var alloc_writer: std.io.Writer.Allocating = .init(std.testing.allocator);
+    var alloc_writer: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer alloc_writer.deinit();
     try implib.writeCoffArchive(std.testing.allocator, &alloc_writer.writer, members);
 

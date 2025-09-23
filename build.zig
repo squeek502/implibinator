@@ -10,6 +10,17 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
+    const main_exe = b.addExecutable(.{
+        .name = "implibinator",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/main.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    main_exe.root_module.addImport("implibinator", mod);
+    b.installArtifact(main_exe);
+
     const check_exe = b.addExecutable(.{
         .name = "check",
         .root_module = b.createModule(.{

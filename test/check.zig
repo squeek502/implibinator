@@ -27,13 +27,13 @@ pub fn main() !void {
         const is_def = std.mem.eql(u8, std.fs.path.extension(entry.basename), ".def");
         if (!is_def) continue;
 
-        const input = try entry.dir.readFileAllocOptions(allocator, entry.basename, std.math.maxInt(usize), null, .of(u8), 0);
+        const input = try entry.dir.readFileAllocOptions(entry.basename, allocator, .unlimited, .of(u8), 0);
         defer allocator.free(input);
 
         const stem = entry.basename[0 .. std.mem.indexOfScalar(u8, entry.basename, '.') orelse entry.basename.len];
         const lib_basename = try std.mem.concat(allocator, u8, &.{ stem, ".lib" });
         defer allocator.free(lib_basename);
-        const expected_output = try entry.dir.readFileAlloc(allocator, lib_basename, std.math.maxInt(usize));
+        const expected_output = try entry.dir.readFileAlloc(lib_basename, allocator, .unlimited);
         defer allocator.free(expected_output);
 
         std.debug.print("{s}\n", .{entry.path});
@@ -55,7 +55,7 @@ fn check(allocator: std.mem.Allocator, input: [:0]const u8, expected_output: []c
     const members = try implib.getMembers(allocator, module_def, .X64);
     defer members.deinit();
 
-    var alloc_writer: std.io.Writer.Allocating = .init(allocator);
+    var alloc_writer: std.Io.Writer.Allocating = .init(allocator);
     defer alloc_writer.deinit();
     try implib.writeCoffArchive(allocator, &alloc_writer.writer, members);
 

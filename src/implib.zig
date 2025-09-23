@@ -2,7 +2,12 @@ const std = @import("std");
 const def = @import("def.zig");
 const Allocator = std.mem.Allocator;
 
-pub fn writeCoffArchive(allocator: std.mem.Allocator, writer: *std.io.Writer, members: Members) !void {
+// LLVM has some quirks/bugs around padding/size values.
+// Emulating those quirks makes it much easier to test this implementation against the LLVM
+// implementation since we can just check if the files are byte-for-byte identical.
+const llvm_compat = true;
+
+pub fn writeCoffArchive(allocator: std.mem.Allocator, writer: *std.Io.Writer, members: Members) !void {
     // TODO: Write a different archive format in this case?
     if (members.list.items.len > 0xfffe) return error.TooManyMembers;
 
@@ -29,13 +34,14 @@ pub fn writeCoffArchive(allocator: std.mem.Allocator, writer: *std.io.Writer, me
 
     for (members.list.items, 0..) |member, i| {
         for (member.symbol_names_for_import_lib) |symbol_name| {
-            // TODO: Is a collision here possible?
-            if (symbol_to_member_index.contains(symbol_name)) {
+            // TODO: A collision here is possible, is doing nothing always the right move?
+            if (!symbol_to_member_index.contains(symbol_name)) {
+                try symbol_to_member_index.putNoClobber(symbol_name, i);
+                string_table_len += symbol_name.len + 1;
+                num_symbols += 1;
+            } else {
                 std.debug.print("duplicate symbol name: {s}\n", .{symbol_name});
             }
-            try symbol_to_member_index.putNoClobber(symbol_name, i);
-            string_table_len += symbol_name.len + 1;
-            num_symbols += 1;
         }
 
         if (member.needsLongName()) {
@@ -51,9 +57,8 @@ pub fn writeCoffArchive(allocator: std.mem.Allocator, writer: *std.io.Writer, me
     };
     const first_member_offset = archive_start.len + archive_header_len + std.mem.alignForward(usize, first_linker_member_len, 2) + archive_header_len + std.mem.alignForward(usize, second_linker_member_len, 2) + long_names_len_including_header_and_padding;
 
-    // TODO: Write 'first linker member'
     // https://learn.microsoft.com/en-us/windows/win32/debug/pe-format#first-linker-member
-    try writeArchiveMemberHeader(writer, .linker_member, first_linker_member_len, "0");
+    try writeArchiveMemberHeader(writer, .linker_member, memberHeaderLen(first_linker_member_len), "0");
     try writer.writeInt(u32, @intCast(num_symbols), .big);
     for (symbol_to_member_index.values()) |member_i| {
         const offset = member_offsets[member_i];
@@ -63,11 +68,10 @@ pub fn writeCoffArchive(allocator: std.mem.Allocator, writer: *std.io.Writer, me
         try writer.writeAll(symbol_name);
         try writer.writeByte(0);
     }
-    if (first_linker_member_len % 2 != 0) try writer.writeByte(archive_pad_byte);
+    if (first_linker_member_len % 2 != 0) try writer.writeByte(if (llvm_compat) 0 else archive_pad_byte);
 
-    // TODO: Write 'second linker member'
     // https://learn.microsoft.com/en-us/windows/win32/debug/pe-format#second-linker-member
-    try writeArchiveMemberHeader(writer, .linker_member, second_linker_member_len, "0");
+    try writeArchiveMemberHeader(writer, .linker_member, memberHeaderLen(second_linker_member_len), "0");
     try writer.writeInt(u32, @intCast(members.list.items.len), .little);
     for (member_offsets) |offset| {
         try writer.writeInt(u32, @intCast(first_member_offset + offset), .little);
@@ -91,14 +95,12 @@ pub fn writeCoffArchive(allocator: std.mem.Allocator, writer: *std.io.Writer, me
         try writer.writeAll(symbol_name);
         try writer.writeByte(0);
     }
-    if (first_linker_member_len % 2 != 0) try writer.writeByte(archive_pad_byte);
+    if (first_linker_member_len % 2 != 0) try writer.writeByte(if (llvm_compat) 0 else archive_pad_byte);
 
-    // TODO: Write longnames member (only if necessary)
     // https://learn.microsoft.com/en-us/windows/win32/debug/pe-format#longnames-member
     if (long_names.data.items.len != 0) {
-        // TODO: LLVM writes this with the padding byte included, likely a bug/mistake?
-        const written_len = std.mem.alignForward(usize, long_names.data.items.len, 2);
-        try writeLongNamesMemberHeader(writer, written_len);
+        const written_len = long_names.data.items.len;
+        try writeLongNamesMemberHeader(writer, memberHeaderLen(written_len));
         try writer.writeAll(long_names.data.items);
         if (long_names.data.items.len % 2 != 0) try writer.writeByte(archive_pad_byte);
     }
@@ -121,13 +123,21 @@ const archive_header_end = "`\n";
 const archive_pad_byte = '\n';
 const archive_header_len = 60;
 
+fn memberHeaderLen(len: usize) usize {
+    return if (llvm_compat)
+        // LLVM writes this with the padding byte included, likely a bug/mistake
+        std.mem.alignForward(usize, len, 2)
+    else
+        len;
+}
+
 const MemberName = union(enum) {
     name: []const u8,
     linker_member,
     longnames_member,
     longname: usize,
 
-    pub fn write(self: MemberName, writer: *std.io.Writer) !void {
+    pub fn write(self: MemberName, writer: *std.Io.Writer) !void {
         switch (self) {
             .name => |name| {
                 try writer.writeAll(name);
@@ -147,14 +157,14 @@ const MemberName = union(enum) {
     }
 };
 
-fn writeLongNamesMemberHeader(writer: *std.io.Writer, size: usize) !void {
+fn writeLongNamesMemberHeader(writer: *std.Io.Writer, size: usize) !void {
     try (MemberName{ .longnames_member = {} }).write(writer);
     try writer.splatByteAll(' ', archive_header_len - 16 - 10 - archive_header_end.len);
     try writer.print("{d: <10}", .{size});
     try writer.writeAll(archive_header_end);
 }
 
-fn writeArchiveMemberHeader(writer: *std.io.Writer, name: MemberName, size: usize, mode: []const u8) !void {
+fn writeArchiveMemberHeader(writer: *std.Io.Writer, name: MemberName, size: usize, mode: []const u8) !void {
     try name.write(writer);
     try writer.writeAll("0           "); // date
     try writer.writeAll("0     "); // user id
@@ -165,7 +175,7 @@ fn writeArchiveMemberHeader(writer: *std.io.Writer, name: MemberName, size: usiz
 }
 
 pub const Members = struct {
-    list: std.ArrayListUnmanaged(Member) = .empty,
+    list: std.ArrayList(Member) = .empty,
     arena: std.heap.ArenaAllocator,
 
     pub const Member = struct {
@@ -216,10 +226,30 @@ pub fn getMembers(
     members.list.appendAssumeCapacity(try getNullImportDescriptor(arena, machine_type, import_name));
     members.list.appendAssumeCapacity(try getNullThunk(arena, machine_type, import_name, null_thunk_symbol_name));
 
-    for (module_def.exports.items) |e| {
+    var renames: std.ArrayList(*const def.ModuleDefinition.Export) = .empty;
+    defer renames.deinit(allocator);
+
+    for (module_def.exports.items) |*e| {
         if (e.private) continue;
 
+        if (e.import_name != null) {
+            try renames.append(allocator, e);
+            continue;
+        }
+
         try members.list.append(arena, try getShortImport(arena, import_name, e.name, e.external_name, machine_type, e.ordinal, e.type, .NAME));
+    }
+    for (renames.items) |e| {
+        if (e.type == .CODE) {
+            try members.list.append(arena, try getWeakExternal(arena, import_name, e.import_name.?, e.name, .{
+                .imp_prefix = false,
+                .machine_type = machine_type,
+            }));
+        }
+        try members.list.append(arena, try getWeakExternal(arena, import_name, e.import_name.?, e.name, .{
+            .imp_prefix = true,
+            .machine_type = machine_type,
+        }));
     }
 
     return members;
@@ -276,7 +306,7 @@ fn getImportDescriptor(
         (std.coff.Symbol.sizeOf() * number_of_symbols) +
         string_table_byte_len;
 
-    var alloc_writer: std.io.Writer.Allocating = try .initCapacity(allocator, total_byte_len);
+    var alloc_writer: std.Io.Writer.Allocating = try .initCapacity(allocator, total_byte_len);
     errdefer alloc_writer.deinit();
     var writer = &alloc_writer.writer;
 
@@ -447,7 +477,7 @@ fn getImportDescriptor(
     try writer.writeAll(null_thunk_symbol_name);
     try writer.writeByte(0);
 
-    var symbol_names_for_import_lib = try std.ArrayListUnmanaged([]const u8).initCapacity(allocator, 1);
+    var symbol_names_for_import_lib = try std.ArrayList([]const u8).initCapacity(allocator, 1);
     errdefer symbol_names_for_import_lib.deinit(allocator);
 
     const duped_symbol_name = try allocator.dupe(u8, import_descriptor_symbol_name);
@@ -474,7 +504,7 @@ fn getNullImportDescriptor(allocator: std.mem.Allocator, machine_type: std.coff.
         (std.coff.Symbol.sizeOf() * number_of_symbols) +
         string_table_byte_len;
 
-    var alloc_writer: std.io.Writer.Allocating = try .initCapacity(allocator, total_byte_len);
+    var alloc_writer: std.Io.Writer.Allocating = try .initCapacity(allocator, total_byte_len);
     errdefer alloc_writer.deinit();
     var writer = &alloc_writer.writer;
 
@@ -531,7 +561,7 @@ fn getNullImportDescriptor(allocator: std.mem.Allocator, machine_type: std.coff.
     try writer.writeAll(null_import_descriptor_symbol_name);
     try writer.writeByte(0);
 
-    var symbol_names_for_import_lib = try std.ArrayListUnmanaged([]const u8).initCapacity(allocator, 1);
+    var symbol_names_for_import_lib = try std.ArrayList([]const u8).initCapacity(allocator, 1);
     errdefer symbol_names_for_import_lib.deinit(allocator);
 
     const duped_symbol_name = try allocator.dupe(u8, null_import_descriptor_symbol_name);
@@ -559,7 +589,7 @@ fn getNullThunk(allocator: std.mem.Allocator, machine_type: std.coff.MachineType
         (std.coff.Symbol.sizeOf() * number_of_symbols) +
         string_table_byte_len;
 
-    var alloc_writer: std.io.Writer.Allocating = try .initCapacity(allocator, total_byte_len);
+    var alloc_writer: std.Io.Writer.Allocating = try .initCapacity(allocator, total_byte_len);
     errdefer alloc_writer.deinit();
     var writer = &alloc_writer.writer;
 
@@ -637,7 +667,7 @@ fn getNullThunk(allocator: std.mem.Allocator, machine_type: std.coff.MachineType
     try writer.writeAll(null_thunk_symbol_name);
     try writer.writeByte(0);
 
-    var symbol_names_for_import_lib = try std.ArrayListUnmanaged([]const u8).initCapacity(allocator, 1);
+    var symbol_names_for_import_lib = try std.ArrayList([]const u8).initCapacity(allocator, 1);
     errdefer symbol_names_for_import_lib.deinit(allocator);
 
     const duped_symbol_name = try allocator.dupe(u8, null_thunk_symbol_name);
@@ -648,6 +678,135 @@ fn getNullThunk(allocator: std.mem.Allocator, machine_type: std.coff.MachineType
         .bytes = try alloc_writer.toOwnedSlice(),
         .name = import_name,
         .symbol_names_for_import_lib = try symbol_names_for_import_lib.toOwnedSlice(allocator),
+    };
+}
+
+const WeakExternalOptions = struct {
+    imp_prefix: bool,
+    machine_type: std.coff.MachineType,
+};
+fn getWeakExternal(arena: std.mem.Allocator, import_name: []const u8, sym: []const u8, weak: []const u8, options: WeakExternalOptions) !Members.Member {
+    const number_of_sections = 1;
+    const number_of_symbols = 4;
+    const number_of_weak_external_defs = 1;
+    const pointer_to_symbol_table = @sizeOf(std.coff.CoffHeader) +
+        (@sizeOf(std.coff.SectionHeader) * number_of_sections);
+
+    const symbol_names = try arena.alloc([]const u8, 2);
+
+    symbol_names[0] = if (options.imp_prefix)
+        try std.mem.concat(arena, u8, &.{ "__imp_", sym })
+    else
+        try arena.dupe(u8, sym);
+
+    symbol_names[1] = if (options.imp_prefix)
+        try std.mem.concat(arena, u8, &.{ "__imp_", weak })
+    else
+        try arena.dupe(u8, weak);
+
+    // TODO: upstream to WeakExternalDefinition struct?
+    const weak_external_def_size = std.coff.Symbol.sizeOf();
+
+    const string_table_byte_len = 4 + symbol_names[0].len + 1 + symbol_names[1].len + 1;
+    const total_byte_len = pointer_to_symbol_table +
+        (std.coff.Symbol.sizeOf() * number_of_symbols) +
+        (weak_external_def_size * number_of_weak_external_defs) +
+        string_table_byte_len;
+
+    const buf = try arena.alloc(u8, total_byte_len);
+
+    var fixed_writer: std.Io.Writer = .fixed(buf);
+    var writer = &fixed_writer;
+
+    try writer.writeStruct(std.coff.CoffHeader{
+        .machine = options.machine_type,
+        .number_of_sections = number_of_sections,
+        .time_date_stamp = 0,
+        .pointer_to_symbol_table = @intCast(pointer_to_symbol_table),
+        .number_of_symbols = number_of_symbols + number_of_weak_external_defs,
+        .size_of_optional_header = 0,
+        .flags = .{},
+    }, .little);
+
+    try writer.writeStruct(std.coff.SectionHeader{
+        .name = ".drectve".*,
+        .virtual_size = 0,
+        .virtual_address = 0,
+        .size_of_raw_data = 0,
+        .pointer_to_raw_data = 0,
+        .pointer_to_relocations = 0,
+        .pointer_to_linenumbers = 0,
+        .number_of_relocations = 0,
+        .number_of_linenumbers = 0,
+        .flags = .{
+            .LNK_INFO = 1,
+            .LNK_REMOVE = 1,
+        },
+    }, .little);
+
+    try writeSymbol(writer, .{
+        .name = "@comp.id".*,
+        .value = 0,
+        .section_number = .ABSOLUTE,
+        .type = .{
+            .base_type = .NULL,
+            .complex_type = .NULL,
+        },
+        .storage_class = .STATIC,
+        .number_of_aux_symbols = 0,
+    });
+    try writeSymbol(writer, .{
+        .name = "@feat.00".*,
+        .value = 0,
+        .section_number = .ABSOLUTE,
+        .type = .{
+            .base_type = .NULL,
+            .complex_type = .NULL,
+        },
+        .storage_class = .STATIC,
+        .number_of_aux_symbols = 0,
+    });
+    var string_table_offset: usize = first_string_table_entry_offset;
+    try writeSymbol(writer, .{
+        .name = first_string_table_entry,
+        .value = 0,
+        .section_number = @enumFromInt(0),
+        .type = .{
+            .base_type = .NULL,
+            .complex_type = .NULL,
+        },
+        .storage_class = .EXTERNAL,
+        .number_of_aux_symbols = 0,
+    });
+    string_table_offset += symbol_names[0].len + 1;
+    try writeSymbol(writer, .{
+        .name = getNameBytesForStringTableOffset(@intCast(string_table_offset)),
+        .value = 0,
+        .section_number = @enumFromInt(0),
+        .type = .{
+            .base_type = .NULL,
+            .complex_type = .NULL,
+        },
+        .storage_class = .WEAK_EXTERNAL,
+        .number_of_aux_symbols = 1,
+    });
+    try writeWeakExternalDefinition(writer, .{
+        .tag_index = 2,
+        .flag = .SEARCH_ALIAS,
+        .unused = @splat(0),
+    });
+
+    // string table
+    try writer.writeInt(u32, @intCast(string_table_byte_len), .little);
+    try writer.writeAll(symbol_names[0]);
+    try writer.writeByte(0);
+    try writer.writeAll(symbol_names[1]);
+    try writer.writeByte(0);
+
+    return .{
+        .bytes = buf,
+        .name = import_name,
+        .symbol_names_for_import_lib = symbol_names,
     };
 }
 
@@ -668,7 +827,7 @@ fn getShortImport(
     const buf = try arena.alloc(u8, total_byte_len);
     errdefer arena.free(buf);
 
-    var writer = std.io.Writer.fixed(buf);
+    var writer = std.Io.Writer.fixed(buf);
 
     writer.writeStruct(std.coff.ImportHeader{
         .sig1 = .UNKNOWN,
@@ -694,7 +853,7 @@ fn getShortImport(
         writer.writeByte(0) catch unreachable;
     }
 
-    var symbol_names_for_import_lib: std.ArrayListUnmanaged([]const u8) = .empty;
+    var symbol_names_for_import_lib: std.ArrayList([]const u8) = .empty;
 
     switch (import_type) {
         .CODE => {
@@ -715,7 +874,7 @@ fn getShortImport(
     };
 }
 
-fn writeSymbol(writer: *std.io.Writer, symbol: std.coff.Symbol) !void {
+fn writeSymbol(writer: *std.Io.Writer, symbol: std.coff.Symbol) !void {
     try writer.writeAll(&symbol.name);
     try writer.writeInt(u32, symbol.value, .little);
     try writer.writeInt(u16, @intFromEnum(symbol.section_number), .little);
@@ -725,7 +884,13 @@ fn writeSymbol(writer: *std.io.Writer, symbol: std.coff.Symbol) !void {
     try writer.writeInt(u8, symbol.number_of_aux_symbols, .little);
 }
 
-fn writeRelocation(writer: *std.io.Writer, relocation: std.coff.Relocation) !void {
+fn writeWeakExternalDefinition(writer: *std.Io.Writer, weak_external: std.coff.WeakExternalDefinition) !void {
+    try writer.writeInt(u32, weak_external.tag_index, .little);
+    try writer.writeInt(u32, @intFromEnum(weak_external.flag), .little);
+    try writer.writeAll(&weak_external.unused);
+}
+
+fn writeRelocation(writer: *std.Io.Writer, relocation: std.coff.Relocation) !void {
     try writer.writeInt(u32, relocation.virtual_address, .little);
     try writer.writeInt(u32, relocation.symbol_table_index, .little);
     try writer.writeInt(u16, relocation.type, .little);
@@ -774,7 +939,7 @@ const Alignment = enum(u4) {
 
 /// Same thing as StringTable in Zig's src/Wasm.zig
 pub const StringTable = struct {
-    data: std.ArrayListUnmanaged(u8) = .empty,
+    data: std.ArrayList(u8) = .empty,
     map: std.HashMapUnmanaged(u32, void, std.hash_map.StringIndexContext, std.hash_map.default_max_load_percentage) = .empty,
 
     pub fn deinit(self: *StringTable, allocator: Allocator) void {
