@@ -12,10 +12,17 @@ pub const ModuleDefinition = struct {
     type: ModuleDefinitionType,
 
     pub const Export = struct {
+        /// This may lack mangling, such as underscore prefixing and stdcall suffixing.
+        /// In a .def file, this is `foo` in `foo` or `bar` in `foo = bar`.
         name: []const u8,
+        /// Note: This is currently only set by `fixupForImportLibraryGeneration`
         mangled_symbol_name: ?[]const u8,
-        external_name: ?[]const u8,
+        /// The external, exported name.
+        /// In a .def file, this is `foo` in `foo = bar`.
+        ext_name: ?[]const u8,
+        /// In a .def file, this is `bar` in `foo == bar`.
         import_name: ?[]const u8,
+        /// In a .def file, this is `bar` in `foo EXPORTAS bar`.
         export_as: ?[]const u8,
         no_name: bool,
         ordinal: u16,
@@ -33,9 +40,9 @@ pub const ModuleDefinition = struct {
             // library and not linking, the internal name is irrelevant. This avoids
             // cases where writeImportLibrary tries to transplant decoration from
             // symbol decoration onto ExtName.
-            if (e.external_name) |external_name| {
-                e.name = external_name;
-                e.external_name = null;
+            if (e.ext_name) |ext_name| {
+                e.name = ext_name;
+                e.ext_name = null;
             }
 
             if (kill_at) {
@@ -83,6 +90,48 @@ pub const Diagnostics = struct {
         unknown_statement,
         unimplemented,
     };
+
+    fn formatToken(ctx: TokenFormatContext, writer: *std.Io.Writer) std.Io.Writer.Error!void {
+        switch (ctx.token.tag) {
+            .eof, .invalid => return writer.writeAll(ctx.token.tag.nameForErrorDisplay()),
+            else => return writer.writeAll(ctx.token.slice(ctx.source)),
+        }
+    }
+
+    const TokenFormatContext = struct {
+        token: Token,
+        source: []const u8,
+    };
+
+    fn fmtToken(self: Diagnostics, source: []const u8) std.fmt.Alt(TokenFormatContext, formatToken) {
+        return .{ .data = .{
+            .token = self.token,
+            .source = source,
+        } };
+    }
+
+    pub fn writeMsg(self: Diagnostics, writer: *std.Io.Writer, source: []const u8) !void {
+        switch (self.err) {
+            .invalid_byte => {
+                return writer.print("invalid byte '{f}'", .{std.ascii.hexEscape(self.token.slice(source), .upper)});
+            },
+            .unfinished_quoted_identifier => {
+                return writer.print("unfinished quoted identifier at '{f}', expected closing '\"'", .{self.fmtToken(source)});
+            },
+            .expected_token => {
+                return writer.print("expected '{s}', got '{f}'", .{ self.extra.expected.nameForErrorDisplay(), self.fmtToken(source) });
+            },
+            .expected_integer => {
+                return writer.print("expected integer, got '{f}'", .{self.fmtToken(source)});
+            },
+            .unimplemented => {
+                return writer.print("support for '{f}' has not yet been implemented", .{self.fmtToken(source)});
+            },
+            .unknown_statement => {
+                return writer.print("unknown/invalid statement syntax beginning with '{f}'", .{self.fmtToken(source)});
+            },
+        }
+    }
 };
 
 pub fn parse(
@@ -137,11 +186,34 @@ const Token = struct {
         keyword_private,
         keyword_stacksize,
         keyword_version,
+
+        pub fn nameForErrorDisplay(self: Tag) []const u8 {
+            return switch (self) {
+                .invalid => "<invalid>",
+                .eof => "<eof>",
+                .identifier => "<identifier>",
+                .comma => ",",
+                .equal => "=",
+                .equal_equal => "==",
+                .keyword_base => "BASE",
+                .keyword_constant => "CONSTANT",
+                .keyword_data => "DATA",
+                .keyword_exports => "EXPORTS",
+                .keyword_exportas => "EXPORTAS",
+                .keyword_heapsize => "HEAPSIZE",
+                .keyword_library => "LIBRARY",
+                .keyword_name => "NAME",
+                .keyword_noname => "NONAME",
+                .keyword_private => "PRIVATE",
+                .keyword_stacksize => "STACKSIZE",
+                .keyword_version => "VERSION",
+            };
+        }
     };
 
     /// Returns a useful slice of the token, e.g. for quoted identifiers, this
     /// will return a slice without the quotes included.
-    pub fn slice(self: Token, source: [:0]const u8) []const u8 {
+    pub fn slice(self: Token, source: []const u8) []const u8 {
         return source[self.start..self.end];
     }
 };
@@ -362,28 +434,28 @@ pub const Parser = struct {
                         if (name_tok.tag != .identifier) break;
                         self.commitLookahead();
 
-                        const external_name_tok = ext_name: {
+                        const ext_name_tok = ext_name: {
                             const equal = try self.lookaheadToken();
                             if (equal.tag != .equal) break :ext_name null;
                             self.commitLookahead();
 
-                            // The syntax is <ext_name>=<name>, so we need to
+                            // The syntax is `<ext_name> = <name>`, so we need to
                             // swap the current name token over to ext_name and use
                             // this token as the name.
-                            const external_name_tok = name_tok;
+                            const ext_name_tok = name_tok;
                             name_tok = try self.expectToken(.identifier);
-                            break :ext_name external_name_tok;
+                            break :ext_name ext_name_tok;
                         };
 
                         var name_needs_underscore = false;
-                        var external_name_needs_underscore = false;
+                        var ext_name_needs_underscore = false;
                         if (self.machine_type == .I386) {
                             const is_decorated = isDecorated(name_tok.slice(self.tokenizer.source), self.module_definition_type);
-                            const is_forward_target = external_name_tok != null and std.mem.indexOfScalar(u8, name_tok.slice(self.tokenizer.source), '.') != null;
+                            const is_forward_target = ext_name_tok != null and std.mem.indexOfScalar(u8, name_tok.slice(self.tokenizer.source), '.') != null;
                             name_needs_underscore = !is_decorated and !is_forward_target;
 
-                            if (external_name_tok) |ext_name| {
-                                external_name_needs_underscore = !isDecorated(ext_name.slice(self.tokenizer.source), self.module_definition_type);
+                            if (ext_name_tok) |ext_name| {
+                                ext_name_needs_underscore = !isDecorated(ext_name.slice(self.tokenizer.source), self.module_definition_type);
                             }
                         }
 
@@ -450,7 +522,7 @@ pub const Parser = struct {
                         else
                             try arena.dupe(u8, name_tok.slice(self.tokenizer.source));
 
-                        const external_name: ?[]const u8 = if (external_name_tok) |ext_name| if (name_needs_underscore)
+                        const ext_name: ?[]const u8 = if (ext_name_tok) |ext_name| if (name_needs_underscore)
                             try std.mem.concat(arena, u8, &.{ "_", ext_name.slice(self.tokenizer.source) })
                         else
                             try arena.dupe(u8, ext_name.slice(self.tokenizer.source)) else null;
@@ -458,7 +530,7 @@ pub const Parser = struct {
                         try module.exports.append(arena, .{
                             .name = name,
                             .mangled_symbol_name = null,
-                            .external_name = external_name,
+                            .ext_name = ext_name,
                             .import_name = if (import_name_tok) |imp_name| try arena.dupe(u8, imp_name.slice(self.tokenizer.source)) else null,
                             .export_as = if (export_as_tok) |export_as| try arena.dupe(u8, export_as.slice(self.tokenizer.source)) else null,
                             .no_name = no_name,
@@ -576,54 +648,343 @@ pub const Parser = struct {
 };
 
 test parse {
-    var diagnostics: Diagnostics = undefined;
     const source =
         \\LIBRARY "foo"
         \\; hello
         \\EXPORTS
         \\foo @ 10
         \\bar @104
+        \\baz@4
         \\foo == bar
+        \\alias = function
+        \\
+        \\data DATA
+        \\constant CONSTANT
         \\
     ;
-    const module = parse(std.testing.allocator, source, .X64, .mingw, &diagnostics) catch |err| switch (err) {
-        error.OutOfMemory => |e| return e,
-        error.ParseError => {
-            std.debug.print("{}: {} {s}\n", .{ diagnostics.err, diagnostics.token, diagnostics.token.slice(source) });
-            return err;
+
+    try testParse(.X64, source, "foo.dll", &[_]ModuleDefinition.Export{
+        .{
+            .name = "foo",
+            .mangled_symbol_name = null,
+            .ext_name = null,
+            .import_name = null,
+            .export_as = null,
+            .no_name = false,
+            .ordinal = 10,
+            .type = .CODE,
+            .private = false,
         },
-    };
-    defer module.deinit();
+        .{
+            .name = "bar",
+            .mangled_symbol_name = null,
+            .ext_name = null,
+            .import_name = null,
+            .export_as = null,
+            .no_name = false,
+            .ordinal = 104,
+            .type = .CODE,
+            .private = false,
+        },
+        .{
+            .name = "baz@4",
+            .mangled_symbol_name = null,
+            .ext_name = null,
+            .import_name = null,
+            .export_as = null,
+            .no_name = false,
+            .ordinal = 0,
+            .type = .CODE,
+            .private = false,
+        },
+        .{
+            .name = "foo",
+            .mangled_symbol_name = null,
+            .ext_name = null,
+            .import_name = "bar",
+            .export_as = null,
+            .no_name = false,
+            .ordinal = 0,
+            .type = .CODE,
+            .private = false,
+        },
+        .{
+            .name = "function",
+            .mangled_symbol_name = null,
+            .ext_name = "alias",
+            .import_name = null,
+            .export_as = null,
+            .no_name = false,
+            .ordinal = 0,
+            .type = .CODE,
+            .private = false,
+        },
+        .{
+            .name = "data",
+            .mangled_symbol_name = null,
+            .ext_name = null,
+            .import_name = null,
+            .export_as = null,
+            .no_name = false,
+            .ordinal = 0,
+            .type = .DATA,
+            .private = false,
+        },
+        .{
+            .name = "constant",
+            .mangled_symbol_name = null,
+            .ext_name = null,
+            .import_name = null,
+            .export_as = null,
+            .no_name = false,
+            .ordinal = 0,
+            .type = .CONST,
+            .private = false,
+        },
+    });
 
-    try std.testing.expectEqualStrings("foo.dll", module.name.?);
+    try testParse(.I386, source, "foo.dll", &[_]ModuleDefinition.Export{
+        .{
+            .name = "_foo",
+            .mangled_symbol_name = null,
+            .ext_name = null,
+            .import_name = null,
+            .export_as = null,
+            .no_name = false,
+            .ordinal = 10,
+            .type = .CODE,
+            .private = false,
+        },
+        .{
+            .name = "_bar",
+            .mangled_symbol_name = null,
+            .ext_name = null,
+            .import_name = null,
+            .export_as = null,
+            .no_name = false,
+            .ordinal = 104,
+            .type = .CODE,
+            .private = false,
+        },
+        .{
+            .name = "_baz@4",
+            .mangled_symbol_name = null,
+            .ext_name = null,
+            .import_name = null,
+            .export_as = null,
+            .no_name = false,
+            .ordinal = 0,
+            .type = .CODE,
+            .private = false,
+        },
+        .{
+            .name = "_foo",
+            .mangled_symbol_name = null,
+            .ext_name = null,
+            .import_name = "bar",
+            .export_as = null,
+            .no_name = false,
+            .ordinal = 0,
+            .type = .CODE,
+            .private = false,
+        },
+        .{
+            .name = "_function",
+            .mangled_symbol_name = null,
+            .ext_name = "_alias",
+            .import_name = null,
+            .export_as = null,
+            .no_name = false,
+            .ordinal = 0,
+            .type = .CODE,
+            .private = false,
+        },
+        .{
+            .name = "_data",
+            .mangled_symbol_name = null,
+            .ext_name = null,
+            .import_name = null,
+            .export_as = null,
+            .no_name = false,
+            .ordinal = 0,
+            .type = .DATA,
+            .private = false,
+        },
+        .{
+            .name = "_constant",
+            .mangled_symbol_name = null,
+            .ext_name = null,
+            .import_name = null,
+            .export_as = null,
+            .no_name = false,
+            .ordinal = 0,
+            .type = .CONST,
+            .private = false,
+        },
+    });
 
-    try std.testing.expectEqual(3, module.exports.items.len);
+    try testParse(.ARMNT, source, "foo.dll", &[_]ModuleDefinition.Export{
+        .{
+            .name = "foo",
+            .mangled_symbol_name = null,
+            .ext_name = null,
+            .import_name = null,
+            .export_as = null,
+            .no_name = false,
+            .ordinal = 10,
+            .type = .CODE,
+            .private = false,
+        },
+        .{
+            .name = "bar",
+            .mangled_symbol_name = null,
+            .ext_name = null,
+            .import_name = null,
+            .export_as = null,
+            .no_name = false,
+            .ordinal = 104,
+            .type = .CODE,
+            .private = false,
+        },
+        .{
+            .name = "baz@4",
+            .mangled_symbol_name = null,
+            .ext_name = null,
+            .import_name = null,
+            .export_as = null,
+            .no_name = false,
+            .ordinal = 0,
+            .type = .CODE,
+            .private = false,
+        },
+        .{
+            .name = "foo",
+            .mangled_symbol_name = null,
+            .ext_name = null,
+            .import_name = "bar",
+            .export_as = null,
+            .no_name = false,
+            .ordinal = 0,
+            .type = .CODE,
+            .private = false,
+        },
+        .{
+            .name = "function",
+            .mangled_symbol_name = null,
+            .ext_name = "alias",
+            .import_name = null,
+            .export_as = null,
+            .no_name = false,
+            .ordinal = 0,
+            .type = .CODE,
+            .private = false,
+        },
+        .{
+            .name = "data",
+            .mangled_symbol_name = null,
+            .ext_name = null,
+            .import_name = null,
+            .export_as = null,
+            .no_name = false,
+            .ordinal = 0,
+            .type = .DATA,
+            .private = false,
+        },
+        .{
+            .name = "constant",
+            .mangled_symbol_name = null,
+            .ext_name = null,
+            .import_name = null,
+            .export_as = null,
+            .no_name = false,
+            .ordinal = 0,
+            .type = .CONST,
+            .private = false,
+        },
+    });
 
-    {
-        const ex = module.exports.items[0];
-        try std.testing.expectEqualStrings("foo", ex.name);
-        try std.testing.expectEqual(null, ex.import_name);
-        try std.testing.expectEqual(null, ex.external_name);
-        try std.testing.expectEqual(10, ex.ordinal);
-    }
-    {
-        const ex = module.exports.items[1];
-        try std.testing.expectEqualStrings("bar", ex.name);
-        try std.testing.expectEqual(null, ex.import_name);
-        try std.testing.expectEqual(null, ex.external_name);
-        try std.testing.expectEqual(104, ex.ordinal);
-    }
-    {
-        const ex = module.exports.items[2];
-        try std.testing.expectEqualStrings("foo", ex.name);
-        try std.testing.expectEqualStrings("bar", ex.import_name.?);
-        try std.testing.expectEqual(null, ex.external_name);
-        try std.testing.expectEqual(0, ex.ordinal);
-    }
+    try testParse(.ARM64, source, "foo.dll", &[_]ModuleDefinition.Export{
+        .{
+            .name = "foo",
+            .mangled_symbol_name = null,
+            .ext_name = null,
+            .import_name = null,
+            .export_as = null,
+            .no_name = false,
+            .ordinal = 10,
+            .type = .CODE,
+            .private = false,
+        },
+        .{
+            .name = "bar",
+            .mangled_symbol_name = null,
+            .ext_name = null,
+            .import_name = null,
+            .export_as = null,
+            .no_name = false,
+            .ordinal = 104,
+            .type = .CODE,
+            .private = false,
+        },
+        .{
+            .name = "baz@4",
+            .mangled_symbol_name = null,
+            .ext_name = null,
+            .import_name = null,
+            .export_as = null,
+            .no_name = false,
+            .ordinal = 0,
+            .type = .CODE,
+            .private = false,
+        },
+        .{
+            .name = "foo",
+            .mangled_symbol_name = null,
+            .ext_name = null,
+            .import_name = "bar",
+            .export_as = null,
+            .no_name = false,
+            .ordinal = 0,
+            .type = .CODE,
+            .private = false,
+        },
+        .{
+            .name = "function",
+            .mangled_symbol_name = null,
+            .ext_name = "alias",
+            .import_name = null,
+            .export_as = null,
+            .no_name = false,
+            .ordinal = 0,
+            .type = .CODE,
+            .private = false,
+        },
+        .{
+            .name = "data",
+            .mangled_symbol_name = null,
+            .ext_name = null,
+            .import_name = null,
+            .export_as = null,
+            .no_name = false,
+            .ordinal = 0,
+            .type = .DATA,
+            .private = false,
+        },
+        .{
+            .name = "constant",
+            .mangled_symbol_name = null,
+            .ext_name = null,
+            .import_name = null,
+            .export_as = null,
+            .no_name = false,
+            .ordinal = 0,
+            .type = .CONST,
+            .private = false,
+        },
+    });
 }
 
 test "ntdll" {
-    var diagnostics: Diagnostics = undefined;
     const source =
         \\;
         \\; Definition file of ntdll.dll
@@ -635,31 +996,84 @@ test "ntdll" {
         \\RtlDispatchAPC@12
         \\RtlActivateActivationContextUnsafeFast@0
     ;
-    const module = parse(std.testing.allocator, source, .X64, .mingw, &diagnostics) catch |err| switch (err) {
+
+    try testParse(.X64, source, "ntdll.dll", &[_]ModuleDefinition.Export{
+        .{
+            .name = "RtlDispatchAPC@12",
+            .mangled_symbol_name = null,
+            .ext_name = null,
+            .import_name = null,
+            .export_as = null,
+            .no_name = false,
+            .ordinal = 0,
+            .type = .CODE,
+            .private = false,
+        },
+        .{
+            .name = "RtlActivateActivationContextUnsafeFast@0",
+            .mangled_symbol_name = null,
+            .ext_name = null,
+            .import_name = null,
+            .export_as = null,
+            .no_name = false,
+            .ordinal = 0,
+            .type = .CODE,
+            .private = false,
+        },
+    });
+}
+
+fn testParse(machine_type: std.coff.MachineType, source: [:0]const u8, expected_module_name: []const u8, expected_exports: []const ModuleDefinition.Export) !void {
+    var diagnostics: Diagnostics = undefined;
+    const module = parse(std.testing.allocator, source, machine_type, .mingw, &diagnostics) catch |err| switch (err) {
         error.OutOfMemory => |e| return e,
         error.ParseError => {
-            std.debug.print("{}: {} {s}\n", .{ diagnostics.err, diagnostics.token, diagnostics.token.slice(source) });
+            const stderr = std.debug.lockStderrWriter(&.{});
+            defer std.debug.unlockStderrWriter();
+            try diagnostics.writeMsg(stderr, source);
+            try stderr.writeByte('\n');
             return err;
         },
     };
     defer module.deinit();
 
-    try std.testing.expectEqualStrings("ntdll.dll", module.name.?);
-
-    try std.testing.expectEqual(2, module.exports.items.len);
-
-    {
-        const ex = module.exports.items[0];
-        try std.testing.expectEqualStrings("RtlDispatchAPC@12", ex.name);
-        try std.testing.expectEqual(null, ex.import_name);
-        try std.testing.expectEqual(null, ex.external_name);
-        try std.testing.expectEqual(0, ex.ordinal);
+    try std.testing.expectEqualStrings(expected_module_name, module.name orelse "");
+    try std.testing.expectEqual(expected_exports.len, module.exports.items.len);
+    for (expected_exports, module.exports.items) |expected, actual| {
+        try std.testing.expectEqualStrings(expected.name, actual.name);
+        try std.testing.expectEqualStrings(expected.export_as orelse "", actual.export_as orelse "");
+        try std.testing.expectEqualStrings(expected.ext_name orelse "", actual.ext_name orelse "");
+        try std.testing.expectEqualStrings(expected.import_name orelse "", actual.import_name orelse "");
+        try std.testing.expectEqualStrings(expected.mangled_symbol_name orelse "", actual.mangled_symbol_name orelse "");
+        try std.testing.expectEqual(expected.ordinal, actual.ordinal);
+        try std.testing.expectEqual(expected.no_name, actual.no_name);
+        try std.testing.expectEqual(expected.private, actual.private);
+        try std.testing.expectEqual(expected.type, actual.type);
     }
-    {
-        const ex = module.exports.items[1];
-        try std.testing.expectEqualStrings("RtlActivateActivationContextUnsafeFast@0", ex.name);
-        try std.testing.expectEqual(null, ex.import_name);
-        try std.testing.expectEqual(null, ex.external_name);
-        try std.testing.expectEqual(0, ex.ordinal);
+}
+
+test "parse errors" {
+    for (&[_]std.coff.MachineType{ .X64, .I386, .ARMNT, .ARM64 }) |machine_type| {
+        try testParseErrorMsg("invalid byte '\\x00'", machine_type, "LIBRARY \x00");
+        try testParseErrorMsg("unfinished quoted identifier at '<eof>', expected closing '\"'", machine_type, "LIBRARY \"foo");
+        try testParseErrorMsg("expected '=', got 'foo'", machine_type, "LIBRARY foo BASE foo");
+        try testParseErrorMsg("expected integer, got 'foo'", machine_type, "EXPORTS foo @ foo");
+        try testParseErrorMsg("support for 'HEAPSIZE' has not yet been implemented", machine_type, "HEAPSIZE");
+        try testParseErrorMsg("unknown/invalid statement syntax beginning with 'LIB'", machine_type, "LIB");
     }
+}
+
+fn testParseErrorMsg(expected_msg: []const u8, machine_type: std.coff.MachineType, source: [:0]const u8) !void {
+    var diagnostics: Diagnostics = undefined;
+    _ = parse(std.testing.allocator, source, machine_type, .mingw, &diagnostics) catch |err| switch (err) {
+        error.OutOfMemory => |e| return e,
+        error.ParseError => {
+            var buf: [256]u8 = undefined;
+            var writer: std.Io.Writer = .fixed(&buf);
+            try diagnostics.writeMsg(&writer, source);
+            try std.testing.expectEqualStrings(expected_msg, writer.buffered());
+            return;
+        },
+    };
+    return error.UnexpectedSuccess;
 }

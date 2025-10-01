@@ -3,8 +3,9 @@ const def = @import("def.zig");
 const Allocator = std.mem.Allocator;
 
 // LLVM has some quirks/bugs around padding/size values.
-// Emulating those quirks makes it much easier to test this implementation against the LLVM
-// implementation since we can just check if the files are byte-for-byte identical.
+// Emulating those quirks made it much easier to test this implementation against the LLVM
+// implementation since we could just check if the .lib files are byte-for-byte identical.
+// This remains set to true out of an abundance of caution.
 const llvm_compat = true;
 
 pub const WriteCoffArchiveError = error{TooManyMembers} || std.Io.Writer.Error || std.mem.Allocator.Error;
@@ -253,9 +254,9 @@ pub fn getMembers(
         const maybe_mangled_name = e.mangled_symbol_name orelse e.name;
         const name = maybe_mangled_name;
 
-        if (e.external_name) |external_name| {
-            _ = external_name;
-            @panic("TODO");
+        if (e.ext_name) |ext_name| {
+            _ = ext_name;
+            @panic("TODO"); // impossible if fixupForImportLibraryGeneration is called
         }
 
         var import_name_type: std.coff.ImportNameType = undefined;
@@ -287,7 +288,7 @@ pub fn getMembers(
         }
 
         try regular_imports.put(allocator, applyNameType(import_name_type, name), name);
-        try members.list.append(arena, try getShortImport(arena, module_import_name, name, e.external_name, machine_type, e.ordinal, e.type, import_name_type));
+        try members.list.append(arena, try getShortImport(arena, module_import_name, name, export_name, machine_type, e.ordinal, e.type, import_name_type));
     }
     for (renames.items) |deferred| {
         const import_name = deferred.e.import_name.?;
@@ -341,7 +342,7 @@ fn applyNameType(name_type: std.coff.ImportNameType, name: []const u8) []const u
 
 fn getNameType(
     symbol: []const u8,
-    external_name: []const u8,
+    ext_name: []const u8,
     machine_type: std.coff.MachineType,
     module_definition_type: def.ModuleDefinitionType,
 ) std.coff.ImportNameType {
@@ -349,11 +350,11 @@ fn getNameType(
     // type IMPORT_NAME, and the exported function name includes the
     // the leading underscore. In MinGW on the other hand, a decorated
     // stdcall function still omits the underscore (IMPORT_NAME_NOPREFIX).
-    if (std.mem.startsWith(u8, external_name, "_") and
-        std.mem.indexOfScalar(u8, external_name, '@') != null and
+    if (std.mem.startsWith(u8, ext_name, "_") and
+        std.mem.indexOfScalar(u8, ext_name, '@') != null and
         module_definition_type != .mingw)
         return .NAME;
-    if (!std.mem.eql(u8, symbol, external_name))
+    if (!std.mem.eql(u8, symbol, ext_name))
         return .NAME_UNDECORATE;
     if (machine_type == .I386 and std.mem.startsWith(u8, symbol, "_"))
         return .NAME_NOPREFIX;
@@ -445,7 +446,7 @@ fn getImportDescriptor(
         .number_of_relocations = number_of_relocations,
         .number_of_linenumbers = 0,
         .flags = .{
-            .ALIGN = @bitCast(@intFromEnum(Alignment.@"4BYTES")),
+            .ALIGN = .@"4BYTES",
             .CNT_INITIALIZED_DATA = 1,
             .MEM_WRITE = 1,
             .MEM_READ = 1,
@@ -463,7 +464,7 @@ fn getImportDescriptor(
         .number_of_relocations = 0,
         .number_of_linenumbers = 0,
         .flags = .{
-            .ALIGN = @bitCast(@intFromEnum(Alignment.@"2BYTES")),
+            .ALIGN = .@"2BYTES",
             .CNT_INITIALIZED_DATA = 1,
             .MEM_WRITE = 1,
             .MEM_READ = 1,
@@ -649,7 +650,7 @@ fn getNullImportDescriptor(
         .number_of_relocations = 0,
         .number_of_linenumbers = 0,
         .flags = .{
-            .ALIGN = @bitCast(@intFromEnum(Alignment.@"4BYTES")),
+            .ALIGN = .@"4BYTES",
             .CNT_INITIALIZED_DATA = 1,
             .MEM_WRITE = 1,
             .MEM_READ = 1,
@@ -742,9 +743,9 @@ fn getNullThunk(
         .number_of_linenumbers = 0,
         .flags = .{
             .ALIGN = if (is64Bit(machine_type))
-                @bitCast(@intFromEnum(Alignment.@"8BYTES"))
+                .@"8BYTES"
             else
-                @bitCast(@intFromEnum(Alignment.@"4BYTES")),
+                .@"4BYTES",
             .CNT_INITIALIZED_DATA = 1,
             .MEM_WRITE = 1,
             .MEM_READ = 1,
@@ -763,9 +764,9 @@ fn getNullThunk(
         .number_of_linenumbers = 0,
         .flags = .{
             .ALIGN = if (is64Bit(machine_type))
-                @bitCast(@intFromEnum(Alignment.@"8BYTES"))
+                .@"8BYTES"
             else
-                @bitCast(@intFromEnum(Alignment.@"4BYTES")),
+                .@"4BYTES",
             .CNT_INITIALIZED_DATA = 1,
             .MEM_WRITE = 1,
             .MEM_READ = 1,
@@ -840,13 +841,10 @@ fn getWeakExternal(
     else
         try arena.dupe(u8, weak);
 
-    // TODO: upstream to WeakExternalDefinition struct?
-    const weak_external_def_size = std.coff.Symbol.sizeOf();
-
     const string_table_byte_len = 4 + symbol_names[0].len + 1 + symbol_names[1].len + 1;
     const total_byte_len = pointer_to_symbol_table +
         (std.coff.Symbol.sizeOf() * number_of_symbols) +
-        (weak_external_def_size * number_of_weak_external_defs) +
+        (std.coff.WeakExternalDefinition.sizeOf() * number_of_weak_external_defs) +
         string_table_byte_len;
 
     const bytes = try arena.alloc(u8, total_byte_len);
@@ -968,8 +966,6 @@ fn getShortImport(
     var writer = std.Io.Writer.fixed(bytes);
 
     writer.writeStruct(std.coff.ImportHeader{
-        .sig1 = .UNKNOWN,
-        .sig2 = 0xFFFF,
         .version = 0,
         .machine = machine_type,
         .time_date_stamp = 0,
@@ -1046,35 +1042,6 @@ pub fn rvaRelocationTypeIndicator(target: std.coff.MachineType) ?u16 {
         else => null,
     };
 }
-
-// TODO: upstream
-const Alignment = enum(u4) {
-    unspecified = 0,
-    @"1BYTES",
-    @"2BYTES",
-    @"4BYTES",
-    @"8BYTES",
-    @"16BYTES",
-    @"32BYTES",
-    @"64BYTES",
-    @"128BYTES",
-    @"256BYTES",
-    @"512BYTES",
-    @"1024BYTES",
-    @"2048BYTES",
-    @"4096BYTES",
-    @"8192BYTES",
-
-    pub fn toByteUnits(a: Alignment) ?u16 {
-        if (@intFromEnum(a) == 0) return null;
-        return @as(u16, 1) << (@intFromEnum(a) - 1);
-    }
-
-    pub fn fromByteUnits(n: u16) Alignment {
-        std.debug.assert(std.math.isPowerOfTwo(n));
-        return @enumFromInt(@ctz(n) + 1);
-    }
-};
 
 const StringTable = struct {
     data: std.ArrayList(u8) = .empty,
