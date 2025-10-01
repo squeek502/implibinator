@@ -27,23 +27,25 @@ pub fn main() !void {
         break :machine_type machine_type;
     };
 
-    const def_path = args[1];
-    const input = try std.fs.cwd().readFileAllocOptions(def_path, allocator, .unlimited, .of(u8), 0);
-    defer allocator.free(input);
+    const members = members: {
+        const def_path = args[1];
+        const input = try std.fs.cwd().readFileAllocOptions(def_path, allocator, .unlimited, .of(u8), 0);
+        defer allocator.free(input);
 
-    var diagnostics: def.Diagnostics = undefined;
-    var module_def = def.parse(allocator, input, machine_type, .mingw, &diagnostics) catch |err| switch (err) {
-        error.OutOfMemory => |e| return e,
-        error.ParseError => {
-            std.debug.print("{}: {} {s}\n", .{ diagnostics.err, diagnostics.token, diagnostics.token.slice(input) });
-            return err;
-        },
+        var diagnostics: def.Diagnostics = undefined;
+        var module_def = def.parse(allocator, input, machine_type, .mingw, &diagnostics) catch |err| switch (err) {
+            error.OutOfMemory => |e| return e,
+            error.ParseError => {
+                std.debug.print("{}: {} {s}\n", .{ diagnostics.err, diagnostics.token, diagnostics.token.slice(input) });
+                return err;
+            },
+        };
+        defer module_def.deinit();
+
+        module_def.fixupForImportLibraryGeneration(machine_type);
+
+        break :members try implib.getMembers(allocator, module_def, machine_type);
     };
-    defer module_def.deinit();
-
-    module_def.fixupForImportLibraryGeneration(machine_type);
-
-    const members = try implib.getMembers(allocator, module_def, machine_type);
     defer members.deinit();
 
     var alloc_writer: std.Io.Writer.Allocating = .init(allocator);
