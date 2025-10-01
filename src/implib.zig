@@ -421,7 +421,7 @@ fn getImportDescriptor(
         (std.coff.Symbol.sizeOf() * number_of_symbols) +
         string_table_byte_len;
 
-    var bytes = try allocator.alloc(u8, total_byte_len);
+    const bytes = try allocator.alloc(u8, total_byte_len);
     errdefer allocator.free(bytes);
     var writer: std.Io.Writer = .fixed(bytes);
 
@@ -625,7 +625,7 @@ fn getNullImportDescriptor(
         (std.coff.Symbol.sizeOf() * number_of_symbols) +
         string_table_byte_len;
 
-    var bytes = try allocator.alloc(u8, total_byte_len);
+    const bytes = try allocator.alloc(u8, total_byte_len);
     errdefer allocator.free(bytes);
     var writer: std.Io.Writer = .fixed(bytes);
 
@@ -717,7 +717,7 @@ fn getNullThunk(
         (std.coff.Symbol.sizeOf() * number_of_symbols) +
         string_table_byte_len;
 
-    var bytes = try allocator.alloc(u8, total_byte_len);
+    const bytes = try allocator.alloc(u8, total_byte_len);
     errdefer allocator.free(bytes);
     var writer: std.Io.Writer = .fixed(bytes);
 
