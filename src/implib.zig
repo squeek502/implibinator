@@ -7,9 +7,17 @@ const Allocator = std.mem.Allocator;
 // implementation since we can just check if the files are byte-for-byte identical.
 const llvm_compat = true;
 
-pub fn writeCoffArchive(allocator: std.mem.Allocator, writer: *std.Io.Writer, members: Members) !void {
-    // TODO: Write a different archive format in this case?
-    if (members.list.items.len > 0xfffe) return error.TooManyMembers;
+pub const WriteCoffArchiveError = error{TooManyMembers} || std.Io.Writer.Error || std.mem.Allocator.Error;
+
+pub fn writeCoffArchive(
+    allocator: std.mem.Allocator,
+    writer: *std.Io.Writer,
+    members: Members,
+) WriteCoffArchiveError!void {
+    // The second linker member of a COFF archive uses a 32-bit integer for the number of members field,
+    // but only 16-bit integers for the "array of 1-based indexes that map symbol names to archive
+    // member offsets." This means that the maximum number of *indexable* members is maxInt(u16) - 1.
+    if (members.list.items.len > std.math.maxInt(u16) - 1) return error.TooManyMembers;
 
     try writer.writeAll(archive_start);
 
@@ -34,14 +42,16 @@ pub fn writeCoffArchive(allocator: std.mem.Allocator, writer: *std.Io.Writer, me
 
     for (members.list.items, 0..) |member, i| {
         for (member.symbol_names_for_import_lib) |symbol_name| {
-            // TODO: A collision here is possible, is doing nothing always the right move?
-            if (!symbol_to_member_index.contains(symbol_name)) {
-                try symbol_to_member_index.putNoClobber(symbol_name, i);
-                string_table_len += symbol_name.len + 1;
-                num_symbols += 1;
-            } else {
-                std.debug.print("duplicate symbol name: {s}\n", .{symbol_name});
-            }
+            const gop_result = try symbol_to_member_index.getOrPut(symbol_name);
+            // When building the symbol map, ignore duplicate symbol names.
+            // This can happen in cases like (using .def file syntax):
+            //  _foo
+            //  foo == _foo
+            if (gop_result.found_existing) continue;
+
+            gop_result.value_ptr.* = i;
+            string_table_len += symbol_name.len + 1;
+            num_symbols += 1;
         }
 
         if (member.needsLongName()) {
@@ -86,7 +96,7 @@ pub fn writeCoffArchive(allocator: std.mem.Allocator, writer: *std.Io.Writer, me
             return std.mem.lessThan(u8, ctx.keys[a_index], ctx.keys[b_index]);
         }
     };
-    symbol_to_member_index.sort(C{ .keys = symbol_to_member_index.keys() });
+    symbol_to_member_index.sortUnstable(C{ .keys = symbol_to_member_index.keys() });
 
     for (symbol_to_member_index.values()) |member_i| {
         try writer.writeInt(u16, @intCast(member_i + 1), .little);
@@ -197,11 +207,13 @@ pub const Members = struct {
     }
 };
 
+const GetMembersError = GetImportDescriptorError || GetShortImportError;
+
 pub fn getMembers(
     allocator: std.mem.Allocator,
     module_def: def.ModuleDefinition,
     machine_type: std.coff.MachineType,
-) !Members {
+) GetMembersError!Members {
     var members: Members = .{
         .arena = std.heap.ArenaAllocator.init(allocator),
     };
@@ -209,8 +221,8 @@ pub fn getMembers(
     errdefer members.deinit();
 
     try members.list.ensureTotalCapacity(arena, 3 + module_def.exports.items.len);
-    const import_name = try arena.dupe(u8, module_def.name orelse "");
-    const library = std.fs.path.stem(import_name);
+    const module_import_name = try arena.dupe(u8, module_def.name orelse "");
+    const library = std.fs.path.stem(module_import_name);
 
     const import_descriptor_symbol_name = try std.mem.concat(arena, u8, &.{
         import_descriptor_prefix,
@@ -222,42 +234,142 @@ pub fn getMembers(
         null_thunk_data_suffix,
     });
 
-    members.list.appendAssumeCapacity(try getImportDescriptor(arena, machine_type, import_name, import_descriptor_symbol_name, null_thunk_symbol_name));
-    members.list.appendAssumeCapacity(try getNullImportDescriptor(arena, machine_type, import_name));
-    members.list.appendAssumeCapacity(try getNullThunk(arena, machine_type, import_name, null_thunk_symbol_name));
+    members.list.appendAssumeCapacity(try getImportDescriptor(arena, machine_type, module_import_name, import_descriptor_symbol_name, null_thunk_symbol_name));
+    members.list.appendAssumeCapacity(try getNullImportDescriptor(arena, machine_type, module_import_name));
+    members.list.appendAssumeCapacity(try getNullThunk(arena, machine_type, module_import_name, null_thunk_symbol_name));
 
-    var renames: std.ArrayList(*const def.ModuleDefinition.Export) = .empty;
+    const DeferredExport = struct {
+        name: []const u8,
+        e: *const def.ModuleDefinition.Export,
+    };
+    var renames: std.ArrayList(DeferredExport) = .empty;
     defer renames.deinit(allocator);
+    var regular_imports: std.StringArrayHashMapUnmanaged([]const u8) = .empty;
+    defer regular_imports.deinit(allocator);
 
     for (module_def.exports.items) |*e| {
         if (e.private) continue;
 
-        if (e.import_name != null) {
-            try renames.append(allocator, e);
-            continue;
+        const maybe_mangled_name = e.mangled_symbol_name orelse e.name;
+        const name = maybe_mangled_name;
+
+        if (e.external_name) |external_name| {
+            _ = external_name;
+            @panic("TODO");
         }
 
-        try members.list.append(arena, try getShortImport(arena, import_name, e.name, e.external_name, machine_type, e.ordinal, e.type, .NAME));
+        var import_name_type: std.coff.ImportNameType = undefined;
+        var export_name: ?[]const u8 = null;
+        if (e.no_name) {
+            import_name_type = .ORDINAL;
+        } else if (e.export_as) |export_as| {
+            import_name_type = .NAME_EXPORTAS;
+            export_name = export_as;
+        } else if (e.import_name) |import_name| {
+            if (machine_type == .I386 and std.mem.eql(u8, applyNameType(.NAME_UNDECORATE, name), import_name)) {
+                import_name_type = .NAME_UNDECORATE;
+            } else if (machine_type == .I386 and std.mem.eql(u8, applyNameType(.NAME_NOPREFIX, name), import_name)) {
+                import_name_type = .NAME_NOPREFIX;
+            } else if (isArm64EC(machine_type)) {
+                import_name_type = .NAME_EXPORTAS;
+                export_name = import_name;
+            } else if (std.mem.eql(u8, name, import_name)) {
+                import_name_type = .NAME;
+            } else {
+                try renames.append(allocator, .{
+                    .name = name,
+                    .e = e,
+                });
+                continue;
+            }
+        } else {
+            import_name_type = getNameType(maybe_mangled_name, e.name, machine_type, module_def.type);
+        }
+
+        try regular_imports.put(allocator, applyNameType(import_name_type, name), name);
+        try members.list.append(arena, try getShortImport(arena, module_import_name, name, e.external_name, machine_type, e.ordinal, e.type, import_name_type));
     }
-    for (renames.items) |e| {
-        if (e.type == .CODE) {
-            try members.list.append(arena, try getWeakExternal(arena, import_name, e.import_name.?, e.name, .{
-                .imp_prefix = false,
+    for (renames.items) |deferred| {
+        const import_name = deferred.e.import_name.?;
+        if (regular_imports.get(import_name)) |symbol| {
+            if (deferred.e.type == .CODE) {
+                try members.list.append(arena, try getWeakExternal(arena, module_import_name, symbol, deferred.name, .{
+                    .imp_prefix = false,
+                    .machine_type = machine_type,
+                }));
+            }
+            try members.list.append(arena, try getWeakExternal(arena, module_import_name, symbol, deferred.name, .{
+                .imp_prefix = true,
                 .machine_type = machine_type,
             }));
+        } else {
+            try members.list.append(arena, try getShortImport(
+                arena,
+                module_import_name,
+                deferred.name,
+                deferred.e.import_name,
+                machine_type,
+                deferred.e.ordinal,
+                deferred.e.type,
+                .NAME_EXPORTAS,
+            ));
         }
-        try members.list.append(arena, try getWeakExternal(arena, import_name, e.import_name.?, e.name, .{
-            .imp_prefix = true,
-            .machine_type = machine_type,
-        }));
     }
 
     return members;
 }
 
+/// Returns a slice of `name`
+fn applyNameType(name_type: std.coff.ImportNameType, name: []const u8) []const u8 {
+    switch (name_type) {
+        .NAME_NOPREFIX, .NAME_UNDECORATE => {
+            if (name.len == 0) return name;
+            const unprefixed = switch (name[0]) {
+                '?', '@', '_' => name[1..],
+                else => name,
+            };
+            if (name_type == .NAME_UNDECORATE) {
+                var split = std.mem.splitScalar(u8, unprefixed, '@');
+                return split.first();
+            } else {
+                return unprefixed;
+            }
+        },
+        else => return name,
+    }
+}
+
+fn getNameType(
+    symbol: []const u8,
+    external_name: []const u8,
+    machine_type: std.coff.MachineType,
+    module_definition_type: def.ModuleDefinitionType,
+) std.coff.ImportNameType {
+    // A decorated stdcall function in MSVC is exported with the
+    // type IMPORT_NAME, and the exported function name includes the
+    // the leading underscore. In MinGW on the other hand, a decorated
+    // stdcall function still omits the underscore (IMPORT_NAME_NOPREFIX).
+    if (std.mem.startsWith(u8, external_name, "_") and
+        std.mem.indexOfScalar(u8, external_name, '@') != null and
+        module_definition_type != .mingw)
+        return .NAME;
+    if (!std.mem.eql(u8, symbol, external_name))
+        return .NAME_UNDECORATE;
+    if (machine_type == .I386 and std.mem.startsWith(u8, symbol, "_"))
+        return .NAME_NOPREFIX;
+    return .NAME;
+}
+
 fn is64Bit(machine_type: std.coff.MachineType) bool {
     return switch (machine_type) {
         .X64, .ARM64, .ARM64EC, .ARM64X => true,
+        else => false,
+    };
+}
+
+fn isArm64EC(machine_type: std.coff.MachineType) bool {
+    return switch (machine_type) {
+        .ARM64EC, .ARM64X => true,
         else => false,
     };
 }
@@ -279,13 +391,15 @@ fn getNameBytesForStringTableOffset(offset: u32) [8]u8 {
     return bytes;
 }
 
+const GetImportDescriptorError = error{UnsupportedMachineType} || std.mem.Allocator.Error;
+
 fn getImportDescriptor(
     allocator: std.mem.Allocator,
     machine_type: std.coff.MachineType,
-    import_name: []const u8,
+    module_import_name: []const u8,
     import_descriptor_symbol_name: []const u8,
     null_thunk_symbol_name: []const u8,
-) !Members.Member {
+) GetImportDescriptorError!Members.Member {
     const number_of_sections = 2;
     const number_of_symbols = 7;
     const number_of_relocations = 3;
@@ -296,7 +410,7 @@ fn getImportDescriptor(
         @sizeOf(std.coff.ImportDirectoryEntry) +
         (byte_size_of_relocation * number_of_relocations);
     const pointer_to_symbol_table = pointer_to_idata6_data +
-        import_name.len + 1;
+        module_import_name.len + 1;
 
     const string_table_byte_len = 4 +
         (import_descriptor_symbol_name.len + 1) +
@@ -306,11 +420,11 @@ fn getImportDescriptor(
         (std.coff.Symbol.sizeOf() * number_of_symbols) +
         string_table_byte_len;
 
-    var alloc_writer: std.Io.Writer.Allocating = try .initCapacity(allocator, total_byte_len);
-    errdefer alloc_writer.deinit();
-    var writer = &alloc_writer.writer;
+    var bytes = try allocator.alloc(u8, total_byte_len);
+    errdefer allocator.free(bytes);
+    var writer: std.Io.Writer = .fixed(bytes);
 
-    try writer.writeStruct(std.coff.CoffHeader{
+    writer.writeStruct(std.coff.CoffHeader{
         .machine = machine_type,
         .number_of_sections = number_of_sections,
         .time_date_stamp = 0,
@@ -318,9 +432,9 @@ fn getImportDescriptor(
         .number_of_symbols = number_of_symbols,
         .size_of_optional_header = 0,
         .flags = .{ .@"32BIT_MACHINE" = @intFromBool(!is64Bit(machine_type)) },
-    }, .little);
+    }, .little) catch unreachable;
 
-    try writer.writeStruct(std.coff.SectionHeader{
+    writer.writeStruct(std.coff.SectionHeader{
         .name = ".idata$2".*,
         .virtual_size = 0,
         .virtual_address = 0,
@@ -336,13 +450,13 @@ fn getImportDescriptor(
             .MEM_WRITE = 1,
             .MEM_READ = 1,
         },
-    }, .little);
+    }, .little) catch unreachable;
 
-    try writer.writeStruct(std.coff.SectionHeader{
+    writer.writeStruct(std.coff.SectionHeader{
         .name = ".idata$6".*,
         .virtual_size = 0,
         .virtual_address = 0,
-        .size_of_raw_data = @intCast(import_name.len + 1),
+        .size_of_raw_data = @intCast(module_import_name.len + 1),
         .pointer_to_raw_data = pointer_to_idata6_data,
         .pointer_to_relocations = 0,
         .pointer_to_linenumbers = 0,
@@ -354,40 +468,40 @@ fn getImportDescriptor(
             .MEM_WRITE = 1,
             .MEM_READ = 1,
         },
-    }, .little);
+    }, .little) catch unreachable;
 
     // .idata$2
-    try writer.writeStruct(std.coff.ImportDirectoryEntry{
+    writer.writeStruct(std.coff.ImportDirectoryEntry{
         .forwarder_chain = 0,
         .import_address_table_rva = 0,
         .import_lookup_table_rva = 0,
         .name_rva = 0,
         .time_date_stamp = 0,
-    }, .little);
+    }, .little) catch unreachable;
 
     const relocation_rva_type = rvaRelocationTypeIndicator(machine_type) orelse return error.UnsupportedMachineType;
-    try writeRelocation(writer, .{
+    writeRelocation(&writer, .{
         .virtual_address = @offsetOf(std.coff.ImportDirectoryEntry, "name_rva"),
         .symbol_table_index = 2,
         .type = relocation_rva_type,
-    });
-    try writeRelocation(writer, .{
+    }) catch unreachable;
+    writeRelocation(&writer, .{
         .virtual_address = @offsetOf(std.coff.ImportDirectoryEntry, "import_lookup_table_rva"),
         .symbol_table_index = 3,
         .type = relocation_rva_type,
-    });
-    try writeRelocation(writer, .{
+    }) catch unreachable;
+    writeRelocation(&writer, .{
         .virtual_address = @offsetOf(std.coff.ImportDirectoryEntry, "import_address_table_rva"),
         .symbol_table_index = 4,
         .type = relocation_rva_type,
-    });
+    }) catch unreachable;
 
     // .idata$6
-    try writer.writeAll(import_name);
-    try writer.writeByte(0);
+    writer.writeAll(module_import_name) catch unreachable;
+    writer.writeByte(0) catch unreachable;
 
     var string_table_offset: usize = first_string_table_entry_offset;
-    try writeSymbol(writer, .{
+    writeSymbol(&writer, .{
         .name = first_string_table_entry,
         .value = 0,
         .section_number = @enumFromInt(1),
@@ -397,9 +511,9 @@ fn getImportDescriptor(
         },
         .storage_class = .EXTERNAL,
         .number_of_aux_symbols = 0,
-    });
+    }) catch unreachable;
     string_table_offset += import_descriptor_symbol_name.len + 1;
-    try writeSymbol(writer, .{
+    writeSymbol(&writer, .{
         .name = ".idata$2".*,
         .value = 0,
         .section_number = @enumFromInt(1),
@@ -409,8 +523,8 @@ fn getImportDescriptor(
         },
         .storage_class = .SECTION,
         .number_of_aux_symbols = 0,
-    });
-    try writeSymbol(writer, .{
+    }) catch unreachable;
+    writeSymbol(&writer, .{
         .name = ".idata$6".*,
         .value = 0,
         .section_number = @enumFromInt(2),
@@ -420,8 +534,8 @@ fn getImportDescriptor(
         },
         .storage_class = .STATIC,
         .number_of_aux_symbols = 0,
-    });
-    try writeSymbol(writer, .{
+    }) catch unreachable;
+    writeSymbol(&writer, .{
         .name = ".idata$4".*,
         .value = 0,
         .section_number = .UNDEFINED,
@@ -431,8 +545,8 @@ fn getImportDescriptor(
         },
         .storage_class = .SECTION,
         .number_of_aux_symbols = 0,
-    });
-    try writeSymbol(writer, .{
+    }) catch unreachable;
+    writeSymbol(&writer, .{
         .name = ".idata$5".*,
         .value = 0,
         .section_number = .UNDEFINED,
@@ -442,8 +556,8 @@ fn getImportDescriptor(
         },
         .storage_class = .SECTION,
         .number_of_aux_symbols = 0,
-    });
-    try writeSymbol(writer, .{
+    }) catch unreachable;
+    writeSymbol(&writer, .{
         .name = getNameBytesForStringTableOffset(@intCast(string_table_offset)),
         .value = 0,
         .section_number = .UNDEFINED,
@@ -453,9 +567,9 @@ fn getImportDescriptor(
         },
         .storage_class = .EXTERNAL,
         .number_of_aux_symbols = 0,
-    });
+    }) catch unreachable;
     string_table_offset += null_import_descriptor_symbol_name.len + 1;
-    try writeSymbol(writer, .{
+    writeSymbol(&writer, .{
         .name = getNameBytesForStringTableOffset(@intCast(string_table_offset)),
         .value = 0,
         .section_number = .UNDEFINED,
@@ -465,33 +579,39 @@ fn getImportDescriptor(
         },
         .storage_class = .EXTERNAL,
         .number_of_aux_symbols = 0,
-    });
+    }) catch unreachable;
     string_table_offset += null_thunk_symbol_name.len + 1;
 
     // string table
-    try writer.writeInt(u32, @intCast(string_table_byte_len), .little);
-    try writer.writeAll(import_descriptor_symbol_name);
-    try writer.writeByte(0);
-    try writer.writeAll(null_import_descriptor_symbol_name);
-    try writer.writeByte(0);
-    try writer.writeAll(null_thunk_symbol_name);
-    try writer.writeByte(0);
+    writer.writeInt(u32, @intCast(string_table_byte_len), .little) catch unreachable;
+    writer.writeAll(import_descriptor_symbol_name) catch unreachable;
+    writer.writeByte(0) catch unreachable;
+    writer.writeAll(null_import_descriptor_symbol_name) catch unreachable;
+    writer.writeByte(0) catch unreachable;
+    writer.writeAll(null_thunk_symbol_name) catch unreachable;
+    writer.writeByte(0) catch unreachable;
 
-    var symbol_names_for_import_lib = try std.ArrayList([]const u8).initCapacity(allocator, 1);
-    errdefer symbol_names_for_import_lib.deinit(allocator);
+    var symbol_names_for_import_lib = try allocator.alloc([]const u8, 1);
+    errdefer allocator.free(symbol_names_for_import_lib);
 
     const duped_symbol_name = try allocator.dupe(u8, import_descriptor_symbol_name);
     errdefer allocator.free(duped_symbol_name);
-    symbol_names_for_import_lib.appendAssumeCapacity(duped_symbol_name);
+    symbol_names_for_import_lib[0] = duped_symbol_name;
 
+    // Confirm byte length was calculated exactly correctly
+    std.debug.assert(writer.end == bytes.len);
     return .{
-        .bytes = try alloc_writer.toOwnedSlice(),
-        .name = import_name,
-        .symbol_names_for_import_lib = try symbol_names_for_import_lib.toOwnedSlice(allocator),
+        .bytes = bytes,
+        .name = module_import_name,
+        .symbol_names_for_import_lib = symbol_names_for_import_lib,
     };
 }
 
-fn getNullImportDescriptor(allocator: std.mem.Allocator, machine_type: std.coff.MachineType, import_name: []const u8) !Members.Member {
+fn getNullImportDescriptor(
+    allocator: std.mem.Allocator,
+    machine_type: std.coff.MachineType,
+    module_import_name: []const u8,
+) error{OutOfMemory}!Members.Member {
     const number_of_sections = 1;
     const number_of_symbols = 1;
     const pointer_to_idata3_data = @sizeOf(std.coff.CoffHeader) +
@@ -504,11 +624,11 @@ fn getNullImportDescriptor(allocator: std.mem.Allocator, machine_type: std.coff.
         (std.coff.Symbol.sizeOf() * number_of_symbols) +
         string_table_byte_len;
 
-    var alloc_writer: std.Io.Writer.Allocating = try .initCapacity(allocator, total_byte_len);
-    errdefer alloc_writer.deinit();
-    var writer = &alloc_writer.writer;
+    var bytes = try allocator.alloc(u8, total_byte_len);
+    errdefer allocator.free(bytes);
+    var writer: std.Io.Writer = .fixed(bytes);
 
-    try writer.writeStruct(std.coff.CoffHeader{
+    writer.writeStruct(std.coff.CoffHeader{
         .machine = machine_type,
         .number_of_sections = number_of_sections,
         .time_date_stamp = 0,
@@ -516,9 +636,9 @@ fn getNullImportDescriptor(allocator: std.mem.Allocator, machine_type: std.coff.
         .number_of_symbols = number_of_symbols,
         .size_of_optional_header = 0,
         .flags = .{ .@"32BIT_MACHINE" = @intFromBool(!is64Bit(machine_type)) },
-    }, .little);
+    }, .little) catch unreachable;
 
-    try writer.writeStruct(std.coff.SectionHeader{
+    writer.writeStruct(std.coff.SectionHeader{
         .name = ".idata$3".*,
         .virtual_size = 0,
         .virtual_address = 0,
@@ -534,17 +654,17 @@ fn getNullImportDescriptor(allocator: std.mem.Allocator, machine_type: std.coff.
             .MEM_WRITE = 1,
             .MEM_READ = 1,
         },
-    }, .little);
+    }, .little) catch unreachable;
 
-    try writer.writeStruct(std.coff.ImportDirectoryEntry{
+    writer.writeStruct(std.coff.ImportDirectoryEntry{
         .forwarder_chain = 0,
         .import_address_table_rva = 0,
         .import_lookup_table_rva = 0,
         .name_rva = 0,
         .time_date_stamp = 0,
-    }, .little);
+    }, .little) catch unreachable;
 
-    try writeSymbol(writer, .{
+    writeSymbol(&writer, .{
         .name = first_string_table_entry,
         .value = 0,
         .section_number = @enumFromInt(1),
@@ -554,28 +674,35 @@ fn getNullImportDescriptor(allocator: std.mem.Allocator, machine_type: std.coff.
         },
         .storage_class = .EXTERNAL,
         .number_of_aux_symbols = 0,
-    });
+    }) catch unreachable;
 
     // string table
-    try writer.writeInt(u32, string_table_byte_len, .little);
-    try writer.writeAll(null_import_descriptor_symbol_name);
-    try writer.writeByte(0);
+    writer.writeInt(u32, string_table_byte_len, .little) catch unreachable;
+    writer.writeAll(null_import_descriptor_symbol_name) catch unreachable;
+    writer.writeByte(0) catch unreachable;
 
-    var symbol_names_for_import_lib = try std.ArrayList([]const u8).initCapacity(allocator, 1);
-    errdefer symbol_names_for_import_lib.deinit(allocator);
+    var symbol_names_for_import_lib = try allocator.alloc([]const u8, 1);
+    errdefer allocator.free(symbol_names_for_import_lib);
 
     const duped_symbol_name = try allocator.dupe(u8, null_import_descriptor_symbol_name);
     errdefer allocator.free(duped_symbol_name);
-    symbol_names_for_import_lib.appendAssumeCapacity(duped_symbol_name);
+    symbol_names_for_import_lib[0] = duped_symbol_name;
 
+    // Confirm byte length was calculated exactly correctly
+    std.debug.assert(writer.end == bytes.len);
     return .{
-        .bytes = try alloc_writer.toOwnedSlice(),
-        .name = import_name,
-        .symbol_names_for_import_lib = try symbol_names_for_import_lib.toOwnedSlice(allocator),
+        .bytes = bytes,
+        .name = module_import_name,
+        .symbol_names_for_import_lib = symbol_names_for_import_lib,
     };
 }
 
-fn getNullThunk(allocator: std.mem.Allocator, machine_type: std.coff.MachineType, import_name: []const u8, null_thunk_symbol_name: []const u8) !Members.Member {
+fn getNullThunk(
+    allocator: std.mem.Allocator,
+    machine_type: std.coff.MachineType,
+    module_import_name: []const u8,
+    null_thunk_symbol_name: []const u8,
+) error{OutOfMemory}!Members.Member {
     const number_of_sections = 2;
     const number_of_symbols = 1;
     const va_size: u32 = if (is64Bit(machine_type)) 8 else 4;
@@ -589,11 +716,11 @@ fn getNullThunk(allocator: std.mem.Allocator, machine_type: std.coff.MachineType
         (std.coff.Symbol.sizeOf() * number_of_symbols) +
         string_table_byte_len;
 
-    var alloc_writer: std.Io.Writer.Allocating = try .initCapacity(allocator, total_byte_len);
-    errdefer alloc_writer.deinit();
-    var writer = &alloc_writer.writer;
+    var bytes = try allocator.alloc(u8, total_byte_len);
+    errdefer allocator.free(bytes);
+    var writer: std.Io.Writer = .fixed(bytes);
 
-    try writer.writeStruct(std.coff.CoffHeader{
+    writer.writeStruct(std.coff.CoffHeader{
         .machine = machine_type,
         .number_of_sections = number_of_sections,
         .time_date_stamp = 0,
@@ -601,9 +728,9 @@ fn getNullThunk(allocator: std.mem.Allocator, machine_type: std.coff.MachineType
         .number_of_symbols = number_of_symbols,
         .size_of_optional_header = 0,
         .flags = .{ .@"32BIT_MACHINE" = @intFromBool(!is64Bit(machine_type)) },
-    }, .little);
+    }, .little) catch unreachable;
 
-    try writer.writeStruct(std.coff.SectionHeader{
+    writer.writeStruct(std.coff.SectionHeader{
         .name = ".idata$5".*,
         .virtual_size = 0,
         .virtual_address = 0,
@@ -622,9 +749,9 @@ fn getNullThunk(allocator: std.mem.Allocator, machine_type: std.coff.MachineType
             .MEM_WRITE = 1,
             .MEM_READ = 1,
         },
-    }, .little);
+    }, .little) catch unreachable;
 
-    try writer.writeStruct(std.coff.SectionHeader{
+    writer.writeStruct(std.coff.SectionHeader{
         .name = ".idata$4".*,
         .virtual_size = 0,
         .virtual_address = 0,
@@ -643,14 +770,14 @@ fn getNullThunk(allocator: std.mem.Allocator, machine_type: std.coff.MachineType
             .MEM_WRITE = 1,
             .MEM_READ = 1,
         },
-    }, .little);
+    }, .little) catch unreachable;
 
     // .idata$5
-    try writer.splatByteAll(0, va_size);
+    writer.splatByteAll(0, va_size) catch unreachable;
     // .idata$4
-    try writer.splatByteAll(0, va_size);
+    writer.splatByteAll(0, va_size) catch unreachable;
 
-    try writeSymbol(writer, .{
+    writeSymbol(&writer, .{
         .name = first_string_table_entry,
         .value = 0,
         .section_number = @enumFromInt(1),
@@ -660,24 +787,26 @@ fn getNullThunk(allocator: std.mem.Allocator, machine_type: std.coff.MachineType
         },
         .storage_class = .EXTERNAL,
         .number_of_aux_symbols = 0,
-    });
+    }) catch unreachable;
 
     // string table
-    try writer.writeInt(u32, @intCast(string_table_byte_len), .little);
-    try writer.writeAll(null_thunk_symbol_name);
-    try writer.writeByte(0);
+    writer.writeInt(u32, @intCast(string_table_byte_len), .little) catch unreachable;
+    writer.writeAll(null_thunk_symbol_name) catch unreachable;
+    writer.writeByte(0) catch unreachable;
 
-    var symbol_names_for_import_lib = try std.ArrayList([]const u8).initCapacity(allocator, 1);
-    errdefer symbol_names_for_import_lib.deinit(allocator);
+    var symbol_names_for_import_lib = try allocator.alloc([]const u8, 1);
+    errdefer allocator.free(symbol_names_for_import_lib);
 
     const duped_symbol_name = try allocator.dupe(u8, null_thunk_symbol_name);
     errdefer allocator.free(duped_symbol_name);
-    symbol_names_for_import_lib.appendAssumeCapacity(duped_symbol_name);
+    symbol_names_for_import_lib[0] = duped_symbol_name;
 
+    // Confirm byte length was calculated exactly correctly
+    std.debug.assert(writer.end == bytes.len);
     return .{
-        .bytes = try alloc_writer.toOwnedSlice(),
-        .name = import_name,
-        .symbol_names_for_import_lib = try symbol_names_for_import_lib.toOwnedSlice(allocator),
+        .bytes = bytes,
+        .name = module_import_name,
+        .symbol_names_for_import_lib = symbol_names_for_import_lib,
     };
 }
 
@@ -685,7 +814,14 @@ const WeakExternalOptions = struct {
     imp_prefix: bool,
     machine_type: std.coff.MachineType,
 };
-fn getWeakExternal(arena: std.mem.Allocator, import_name: []const u8, sym: []const u8, weak: []const u8, options: WeakExternalOptions) !Members.Member {
+
+fn getWeakExternal(
+    arena: std.mem.Allocator,
+    module_import_name: []const u8,
+    sym: []const u8,
+    weak: []const u8,
+    options: WeakExternalOptions,
+) error{OutOfMemory}!Members.Member {
     const number_of_sections = 1;
     const number_of_symbols = 4;
     const number_of_weak_external_defs = 1;
@@ -713,12 +849,11 @@ fn getWeakExternal(arena: std.mem.Allocator, import_name: []const u8, sym: []con
         (weak_external_def_size * number_of_weak_external_defs) +
         string_table_byte_len;
 
-    const buf = try arena.alloc(u8, total_byte_len);
+    const bytes = try arena.alloc(u8, total_byte_len);
+    errdefer arena.free(bytes);
+    var writer: std.Io.Writer = .fixed(bytes);
 
-    var fixed_writer: std.Io.Writer = .fixed(buf);
-    var writer = &fixed_writer;
-
-    try writer.writeStruct(std.coff.CoffHeader{
+    writer.writeStruct(std.coff.CoffHeader{
         .machine = options.machine_type,
         .number_of_sections = number_of_sections,
         .time_date_stamp = 0,
@@ -726,9 +861,9 @@ fn getWeakExternal(arena: std.mem.Allocator, import_name: []const u8, sym: []con
         .number_of_symbols = number_of_symbols + number_of_weak_external_defs,
         .size_of_optional_header = 0,
         .flags = .{},
-    }, .little);
+    }, .little) catch unreachable;
 
-    try writer.writeStruct(std.coff.SectionHeader{
+    writer.writeStruct(std.coff.SectionHeader{
         .name = ".drectve".*,
         .virtual_size = 0,
         .virtual_address = 0,
@@ -742,9 +877,9 @@ fn getWeakExternal(arena: std.mem.Allocator, import_name: []const u8, sym: []con
             .LNK_INFO = 1,
             .LNK_REMOVE = 1,
         },
-    }, .little);
+    }, .little) catch unreachable;
 
-    try writeSymbol(writer, .{
+    writeSymbol(&writer, .{
         .name = "@comp.id".*,
         .value = 0,
         .section_number = .ABSOLUTE,
@@ -754,8 +889,8 @@ fn getWeakExternal(arena: std.mem.Allocator, import_name: []const u8, sym: []con
         },
         .storage_class = .STATIC,
         .number_of_aux_symbols = 0,
-    });
-    try writeSymbol(writer, .{
+    }) catch unreachable;
+    writeSymbol(&writer, .{
         .name = "@feat.00".*,
         .value = 0,
         .section_number = .ABSOLUTE,
@@ -765,9 +900,9 @@ fn getWeakExternal(arena: std.mem.Allocator, import_name: []const u8, sym: []con
         },
         .storage_class = .STATIC,
         .number_of_aux_symbols = 0,
-    });
+    }) catch unreachable;
     var string_table_offset: usize = first_string_table_entry_offset;
-    try writeSymbol(writer, .{
+    writeSymbol(&writer, .{
         .name = first_string_table_entry,
         .value = 0,
         .section_number = @enumFromInt(0),
@@ -777,9 +912,9 @@ fn getWeakExternal(arena: std.mem.Allocator, import_name: []const u8, sym: []con
         },
         .storage_class = .EXTERNAL,
         .number_of_aux_symbols = 0,
-    });
+    }) catch unreachable;
     string_table_offset += symbol_names[0].len + 1;
-    try writeSymbol(writer, .{
+    writeSymbol(&writer, .{
         .name = getNameBytesForStringTableOffset(@intCast(string_table_offset)),
         .value = 0,
         .section_number = @enumFromInt(0),
@@ -789,45 +924,48 @@ fn getWeakExternal(arena: std.mem.Allocator, import_name: []const u8, sym: []con
         },
         .storage_class = .WEAK_EXTERNAL,
         .number_of_aux_symbols = 1,
-    });
-    try writeWeakExternalDefinition(writer, .{
+    }) catch unreachable;
+    writeWeakExternalDefinition(&writer, .{
         .tag_index = 2,
         .flag = .SEARCH_ALIAS,
         .unused = @splat(0),
-    });
+    }) catch unreachable;
 
     // string table
-    try writer.writeInt(u32, @intCast(string_table_byte_len), .little);
-    try writer.writeAll(symbol_names[0]);
-    try writer.writeByte(0);
-    try writer.writeAll(symbol_names[1]);
-    try writer.writeByte(0);
+    writer.writeInt(u32, @intCast(string_table_byte_len), .little) catch unreachable;
+    writer.writeAll(symbol_names[0]) catch unreachable;
+    writer.writeByte(0) catch unreachable;
+    writer.writeAll(symbol_names[1]) catch unreachable;
+    writer.writeByte(0) catch unreachable;
 
+    // Confirm byte length was calculated exactly correctly
+    std.debug.assert(writer.end == bytes.len);
     return .{
-        .bytes = buf,
-        .name = import_name,
+        .bytes = bytes,
+        .name = module_import_name,
         .symbol_names_for_import_lib = symbol_names,
     };
 }
 
+const GetShortImportError = error{UnknownImportType} || std.mem.Allocator.Error;
+
 fn getShortImport(
     arena: std.mem.Allocator,
-    import_name: []const u8,
+    module_import_name: []const u8,
     sym: []const u8,
     export_name: ?[]const u8,
     machine_type: std.coff.MachineType,
     ordinal_hint: u16,
     import_type: std.coff.ImportType,
     name_type: std.coff.ImportNameType,
-) !Members.Member {
-    var size_of_data = import_name.len + 1 + sym.len + 1;
+) GetShortImportError!Members.Member {
+    var size_of_data = module_import_name.len + 1 + sym.len + 1;
     if (export_name) |name| size_of_data += name.len + 1;
     const total_byte_len = @sizeOf(std.coff.ImportHeader) + size_of_data;
 
-    const buf = try arena.alloc(u8, total_byte_len);
-    errdefer arena.free(buf);
-
-    var writer = std.Io.Writer.fixed(buf);
+    const bytes = try arena.alloc(u8, total_byte_len);
+    errdefer arena.free(bytes);
+    var writer = std.Io.Writer.fixed(bytes);
 
     writer.writeStruct(std.coff.ImportHeader{
         .sig1 = .UNKNOWN,
@@ -846,30 +984,31 @@ fn getShortImport(
 
     writer.writeAll(sym) catch unreachable;
     writer.writeByte(0) catch unreachable;
-    writer.writeAll(import_name) catch unreachable;
+    writer.writeAll(module_import_name) catch unreachable;
     writer.writeByte(0) catch unreachable;
     if (export_name) |name| {
         writer.writeAll(name) catch unreachable;
         writer.writeByte(0) catch unreachable;
     }
 
-    var symbol_names_for_import_lib: std.ArrayList([]const u8) = .empty;
+    var symbol_names_for_import_lib: std.ArrayList([]const u8) = try .initCapacity(arena, 2);
 
     switch (import_type) {
-        .CODE => {
-            try symbol_names_for_import_lib.append(arena, try std.mem.concat(arena, u8, &.{ "__imp_", sym }));
-            try symbol_names_for_import_lib.append(arena, try arena.dupe(u8, sym));
+        .CODE, .CONST => {
+            symbol_names_for_import_lib.appendAssumeCapacity(try std.mem.concat(arena, u8, &.{ "__imp_", sym }));
+            symbol_names_for_import_lib.appendAssumeCapacity(try arena.dupe(u8, sym));
         },
         .DATA => {
-            try symbol_names_for_import_lib.append(arena, try std.mem.concat(arena, u8, &.{ "__imp_", sym }));
+            symbol_names_for_import_lib.appendAssumeCapacity(try std.mem.concat(arena, u8, &.{ "__imp_", sym }));
         },
-        .CONST => @panic("TODO"),
         else => return error.UnknownImportType,
     }
 
+    // Confirm byte length was calculated exactly correctly
+    std.debug.assert(writer.end == bytes.len);
     return .{
-        .bytes = buf,
-        .name = import_name,
+        .bytes = bytes,
+        .name = module_import_name,
         .symbol_names_for_import_lib = try symbol_names_for_import_lib.toOwnedSlice(arena),
     };
 }
@@ -937,8 +1076,7 @@ const Alignment = enum(u4) {
     }
 };
 
-/// Same thing as StringTable in Zig's src/Wasm.zig
-pub const StringTable = struct {
+const StringTable = struct {
     data: std.ArrayList(u8) = .empty,
     map: std.HashMapUnmanaged(u32, void, std.hash_map.StringIndexContext, std.hash_map.default_max_load_percentage) = .empty,
 

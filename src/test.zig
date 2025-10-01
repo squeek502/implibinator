@@ -12,7 +12,7 @@ test "longnames" {
 
 fn check(input: [:0]const u8, expected: []const u8) !void {
     var diagnostics: def.Diagnostics = undefined;
-    const module_def = def.parse(std.testing.allocator, input, &diagnostics) catch |err| switch (err) {
+    const module_def = def.parse(std.testing.allocator, input, .X64, .mingw, &diagnostics) catch |err| switch (err) {
         error.OutOfMemory => |e| return e,
         error.ParseError => {
             std.debug.print("{}: {} {s}\n", .{ diagnostics.err, diagnostics.token, diagnostics.token.slice(input) });

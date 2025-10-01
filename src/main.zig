@@ -12,16 +12,27 @@ pub fn main() !void {
     defer std.process.argsFree(allocator, args);
 
     if (args.len < 3) {
-        std.debug.print("usage: implibinator <def path> <lib path>", .{});
+        std.debug.print("usage: implibinator <def path> <lib path> [machine type]", .{});
         std.process.exit(1);
     }
+
+    const machine_type = machine_type: {
+        var machine_type: std.coff.MachineType = .X64;
+        if (args.len >= 4) {
+            machine_type = std.meta.stringToEnum(std.coff.MachineType, args[3]) orelse {
+                std.debug.print("unknown or unsupported machine type: {s}\n", .{args[3]});
+                std.process.exit(1);
+            };
+        }
+        break :machine_type machine_type;
+    };
 
     const def_path = args[1];
     const input = try std.fs.cwd().readFileAllocOptions(def_path, allocator, .unlimited, .of(u8), 0);
     defer allocator.free(input);
 
     var diagnostics: def.Diagnostics = undefined;
-    const module_def = def.parse(allocator, input, &diagnostics) catch |err| switch (err) {
+    var module_def = def.parse(allocator, input, machine_type, .mingw, &diagnostics) catch |err| switch (err) {
         error.OutOfMemory => |e| return e,
         error.ParseError => {
             std.debug.print("{}: {} {s}\n", .{ diagnostics.err, diagnostics.token, diagnostics.token.slice(input) });
@@ -30,7 +41,9 @@ pub fn main() !void {
     };
     defer module_def.deinit();
 
-    const members = try implib.getMembers(allocator, module_def, .X64);
+    module_def.fixupForImportLibraryGeneration(machine_type);
+
+    const members = try implib.getMembers(allocator, module_def, machine_type);
     defer members.deinit();
 
     var alloc_writer: std.Io.Writer.Allocating = .init(allocator);

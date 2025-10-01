@@ -16,6 +16,17 @@ pub fn main() !void {
         std.process.exit(1);
     }
 
+    const machine_type = machine_type: {
+        var machine_type: std.coff.MachineType = .X64;
+        if (args.len >= 3) {
+            machine_type = std.meta.stringToEnum(std.coff.MachineType, args[2]) orelse {
+                std.debug.print("unknown or unsupported machine type: {s}\n", .{args[2]});
+                std.process.exit(1);
+            };
+        }
+        break :machine_type machine_type;
+    };
+
     const root_dir_path = args[1];
     var root_dir = try std.fs.cwd().openDir(root_dir_path, .{ .iterate = true });
     defer root_dir.close();
@@ -33,17 +44,23 @@ pub fn main() !void {
         const stem = entry.basename[0 .. std.mem.indexOfScalar(u8, entry.basename, '.') orelse entry.basename.len];
         const lib_basename = try std.mem.concat(allocator, u8, &.{ stem, ".lib" });
         defer allocator.free(lib_basename);
-        const expected_output = try entry.dir.readFileAlloc(lib_basename, allocator, .unlimited);
+        const expected_output = entry.dir.readFileAlloc(lib_basename, allocator, .unlimited) catch |err| switch (err) {
+            error.FileNotFound => {
+                std.debug.print("no matching .lib for {s}, skipping\n", .{entry.path});
+                continue;
+            },
+            else => |e| return e,
+        };
         defer allocator.free(expected_output);
 
         std.debug.print("{s}\n", .{entry.path});
-        try check(allocator, input, expected_output);
+        try check(allocator, input, expected_output, machine_type);
     }
 }
 
-fn check(allocator: std.mem.Allocator, input: [:0]const u8, expected_output: []const u8) !void {
+fn check(allocator: std.mem.Allocator, input: [:0]const u8, expected_output: []const u8, machine_type: std.coff.MachineType) !void {
     var diagnostics: def.Diagnostics = undefined;
-    const module_def = def.parse(allocator, input, &diagnostics) catch |err| switch (err) {
+    var module_def = def.parse(allocator, input, machine_type, .mingw, &diagnostics) catch |err| switch (err) {
         error.OutOfMemory => |e| return e,
         error.ParseError => {
             std.debug.print("{}: {} {s}\n", .{ diagnostics.err, diagnostics.token, diagnostics.token.slice(input) });
@@ -52,7 +69,9 @@ fn check(allocator: std.mem.Allocator, input: [:0]const u8, expected_output: []c
     };
     defer module_def.deinit();
 
-    const members = try implib.getMembers(allocator, module_def, .X64);
+    module_def.fixupForImportLibraryGeneration(machine_type);
+
+    const members = try implib.getMembers(allocator, module_def, machine_type);
     defer members.deinit();
 
     var alloc_writer: std.Io.Writer.Allocating = .init(allocator);
