@@ -32,7 +32,7 @@ pub const ModuleDefinition = struct {
 
     /// Modifies `exports` such that import library generation will
     /// behave as expected. Based on LLVM's dlltool driver.
-    pub fn fixupForImportLibraryGeneration(self: *ModuleDefinition, machine_type: std.coff.MachineType) void {
+    pub fn fixupForImportLibraryGeneration(self: *ModuleDefinition, machine_type: std.coff.IMAGE.FILE.MACHINE) void {
         const kill_at = true;
         for (self.exports.items) |*e| {
             // If ExtName is set (if the "ExtName = Name" syntax was used), overwrite
@@ -137,7 +137,7 @@ pub const Diagnostics = struct {
 pub fn parse(
     allocator: std.mem.Allocator,
     source: [:0]const u8,
-    machine_type: std.coff.MachineType,
+    machine_type: std.coff.IMAGE.FILE.MACHINE,
     module_definition_type: ModuleDefinitionType,
     diagnostics: *Diagnostics,
 ) !ModuleDefinition {
@@ -374,12 +374,12 @@ pub const Parser = struct {
     tokenizer: *Tokenizer,
     diagnostics: *Diagnostics,
     lookahead_tokenizer: Tokenizer,
-    machine_type: std.coff.MachineType,
+    machine_type: std.coff.IMAGE.FILE.MACHINE,
     module_definition_type: ModuleDefinitionType,
 
     pub fn init(
         tokenizer: *Tokenizer,
-        machine_type: std.coff.MachineType,
+        machine_type: std.coff.IMAGE.FILE.MACHINE,
         module_definition_type: ModuleDefinitionType,
         diagnostics: *Diagnostics,
     ) Parser {
@@ -663,7 +663,7 @@ test parse {
         \\
     ;
 
-    try testParse(.X64, source, "foo.dll", &[_]ModuleDefinition.Export{
+    try testParse(.AMD64, source, "foo.dll", &[_]ModuleDefinition.Export{
         .{
             .name = "foo",
             .mangled_symbol_name = null,
@@ -997,7 +997,7 @@ test "ntdll" {
         \\RtlActivateActivationContextUnsafeFast@0
     ;
 
-    try testParse(.X64, source, "ntdll.dll", &[_]ModuleDefinition.Export{
+    try testParse(.AMD64, source, "ntdll.dll", &[_]ModuleDefinition.Export{
         .{
             .name = "RtlDispatchAPC@12",
             .mangled_symbol_name = null,
@@ -1023,7 +1023,7 @@ test "ntdll" {
     });
 }
 
-fn testParse(machine_type: std.coff.MachineType, source: [:0]const u8, expected_module_name: []const u8, expected_exports: []const ModuleDefinition.Export) !void {
+fn testParse(machine_type: std.coff.IMAGE.FILE.MACHINE, source: [:0]const u8, expected_module_name: []const u8, expected_exports: []const ModuleDefinition.Export) !void {
     var diagnostics: Diagnostics = undefined;
     const module = parse(std.testing.allocator, source, machine_type, .mingw, &diagnostics) catch |err| switch (err) {
         error.OutOfMemory => |e| return e,
@@ -1053,7 +1053,7 @@ fn testParse(machine_type: std.coff.MachineType, source: [:0]const u8, expected_
 }
 
 test "parse errors" {
-    for (&[_]std.coff.MachineType{ .X64, .I386, .ARMNT, .ARM64 }) |machine_type| {
+    for (&[_]std.coff.IMAGE.FILE.MACHINE{ .AMD64, .I386, .ARMNT, .ARM64 }) |machine_type| {
         try testParseErrorMsg("invalid byte '\\x00'", machine_type, "LIBRARY \x00");
         try testParseErrorMsg("unfinished quoted identifier at '<eof>', expected closing '\"'", machine_type, "LIBRARY \"foo");
         try testParseErrorMsg("expected '=', got 'foo'", machine_type, "LIBRARY foo BASE foo");
@@ -1063,7 +1063,7 @@ test "parse errors" {
     }
 }
 
-fn testParseErrorMsg(expected_msg: []const u8, machine_type: std.coff.MachineType, source: [:0]const u8) !void {
+fn testParseErrorMsg(expected_msg: []const u8, machine_type: std.coff.IMAGE.FILE.MACHINE, source: [:0]const u8) !void {
     var diagnostics: Diagnostics = undefined;
     _ = parse(std.testing.allocator, source, machine_type, .mingw, &diagnostics) catch |err| switch (err) {
         error.OutOfMemory => |e| return e,

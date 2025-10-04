@@ -213,7 +213,7 @@ const GetMembersError = GetImportDescriptorError || GetShortImportError;
 pub fn getMembers(
     allocator: std.mem.Allocator,
     module_def: def.ModuleDefinition,
-    machine_type: std.coff.MachineType,
+    machine_type: std.coff.IMAGE.FILE.MACHINE,
 ) GetMembersError!Members {
     var members: Members = .{
         .arena = std.heap.ArenaAllocator.init(allocator),
@@ -343,7 +343,7 @@ fn applyNameType(name_type: std.coff.ImportNameType, name: []const u8) []const u
 fn getNameType(
     symbol: []const u8,
     ext_name: []const u8,
-    machine_type: std.coff.MachineType,
+    machine_type: std.coff.IMAGE.FILE.MACHINE,
     module_definition_type: def.ModuleDefinitionType,
 ) std.coff.ImportNameType {
     // A decorated stdcall function in MSVC is exported with the
@@ -361,14 +361,14 @@ fn getNameType(
     return .NAME;
 }
 
-fn is64Bit(machine_type: std.coff.MachineType) bool {
+fn is64Bit(machine_type: std.coff.IMAGE.FILE.MACHINE) bool {
     return switch (machine_type) {
-        .X64, .ARM64, .ARM64EC, .ARM64X => true,
+        .AMD64, .ARM64, .ARM64EC, .ARM64X => true,
         else => false,
     };
 }
 
-fn isArm64EC(machine_type: std.coff.MachineType) bool {
+fn isArm64EC(machine_type: std.coff.IMAGE.FILE.MACHINE) bool {
     return switch (machine_type) {
         .ARM64EC, .ARM64X => true,
         else => false,
@@ -396,7 +396,7 @@ const GetImportDescriptorError = error{UnsupportedMachineType} || std.mem.Alloca
 
 fn getImportDescriptor(
     allocator: std.mem.Allocator,
-    machine_type: std.coff.MachineType,
+    machine_type: std.coff.IMAGE.FILE.MACHINE,
     module_import_name: []const u8,
     import_descriptor_symbol_name: []const u8,
     null_thunk_symbol_name: []const u8,
@@ -405,7 +405,7 @@ fn getImportDescriptor(
     const number_of_symbols = 7;
     const number_of_relocations = 3;
 
-    const pointer_to_idata2_data = @sizeOf(std.coff.CoffHeader) +
+    const pointer_to_idata2_data = @sizeOf(std.coff.Header) +
         (@sizeOf(std.coff.SectionHeader) * number_of_sections);
     const pointer_to_idata6_data = pointer_to_idata2_data +
         @sizeOf(std.coff.ImportDirectoryEntry) +
@@ -425,14 +425,14 @@ fn getImportDescriptor(
     errdefer allocator.free(bytes);
     var writer: std.Io.Writer = .fixed(bytes);
 
-    writer.writeStruct(std.coff.CoffHeader{
+    writer.writeStruct(std.coff.Header{
         .machine = machine_type,
         .number_of_sections = number_of_sections,
         .time_date_stamp = 0,
         .pointer_to_symbol_table = @intCast(pointer_to_symbol_table),
         .number_of_symbols = number_of_symbols,
         .size_of_optional_header = 0,
-        .flags = .{ .@"32BIT_MACHINE" = @intFromBool(!is64Bit(machine_type)) },
+        .flags = .{ .@"32BIT_MACHINE" = !is64Bit(machine_type) },
     }, .little) catch unreachable;
 
     writer.writeStruct(std.coff.SectionHeader{
@@ -447,9 +447,9 @@ fn getImportDescriptor(
         .number_of_linenumbers = 0,
         .flags = .{
             .ALIGN = .@"4BYTES",
-            .CNT_INITIALIZED_DATA = 1,
-            .MEM_WRITE = 1,
-            .MEM_READ = 1,
+            .CNT_INITIALIZED_DATA = true,
+            .MEM_WRITE = true,
+            .MEM_READ = true,
         },
     }, .little) catch unreachable;
 
@@ -465,9 +465,9 @@ fn getImportDescriptor(
         .number_of_linenumbers = 0,
         .flags = .{
             .ALIGN = .@"2BYTES",
-            .CNT_INITIALIZED_DATA = 1,
-            .MEM_WRITE = 1,
-            .MEM_READ = 1,
+            .CNT_INITIALIZED_DATA = true,
+            .MEM_WRITE = true,
+            .MEM_READ = true,
         },
     }, .little) catch unreachable;
 
@@ -610,12 +610,12 @@ fn getImportDescriptor(
 
 fn getNullImportDescriptor(
     allocator: std.mem.Allocator,
-    machine_type: std.coff.MachineType,
+    machine_type: std.coff.IMAGE.FILE.MACHINE,
     module_import_name: []const u8,
 ) error{OutOfMemory}!Members.Member {
     const number_of_sections = 1;
     const number_of_symbols = 1;
-    const pointer_to_idata3_data = @sizeOf(std.coff.CoffHeader) +
+    const pointer_to_idata3_data = @sizeOf(std.coff.Header) +
         (@sizeOf(std.coff.SectionHeader) * number_of_sections);
     const pointer_to_symbol_table = pointer_to_idata3_data +
         @sizeOf(std.coff.ImportDirectoryEntry);
@@ -629,14 +629,14 @@ fn getNullImportDescriptor(
     errdefer allocator.free(bytes);
     var writer: std.Io.Writer = .fixed(bytes);
 
-    writer.writeStruct(std.coff.CoffHeader{
+    writer.writeStruct(std.coff.Header{
         .machine = machine_type,
         .number_of_sections = number_of_sections,
         .time_date_stamp = 0,
         .pointer_to_symbol_table = @intCast(pointer_to_symbol_table),
         .number_of_symbols = number_of_symbols,
         .size_of_optional_header = 0,
-        .flags = .{ .@"32BIT_MACHINE" = @intFromBool(!is64Bit(machine_type)) },
+        .flags = .{ .@"32BIT_MACHINE" = !is64Bit(machine_type) },
     }, .little) catch unreachable;
 
     writer.writeStruct(std.coff.SectionHeader{
@@ -651,9 +651,9 @@ fn getNullImportDescriptor(
         .number_of_linenumbers = 0,
         .flags = .{
             .ALIGN = .@"4BYTES",
-            .CNT_INITIALIZED_DATA = 1,
-            .MEM_WRITE = 1,
-            .MEM_READ = 1,
+            .CNT_INITIALIZED_DATA = true,
+            .MEM_WRITE = true,
+            .MEM_READ = true,
         },
     }, .little) catch unreachable;
 
@@ -700,14 +700,14 @@ fn getNullImportDescriptor(
 
 fn getNullThunk(
     allocator: std.mem.Allocator,
-    machine_type: std.coff.MachineType,
+    machine_type: std.coff.IMAGE.FILE.MACHINE,
     module_import_name: []const u8,
     null_thunk_symbol_name: []const u8,
 ) error{OutOfMemory}!Members.Member {
     const number_of_sections = 2;
     const number_of_symbols = 1;
     const va_size: u32 = if (is64Bit(machine_type)) 8 else 4;
-    const pointer_to_idata5_data = @sizeOf(std.coff.CoffHeader) +
+    const pointer_to_idata5_data = @sizeOf(std.coff.Header) +
         (@sizeOf(std.coff.SectionHeader) * number_of_sections);
     const pointer_to_idata4_data = pointer_to_idata5_data + va_size;
     const pointer_to_symbol_table = pointer_to_idata4_data + va_size;
@@ -721,14 +721,14 @@ fn getNullThunk(
     errdefer allocator.free(bytes);
     var writer: std.Io.Writer = .fixed(bytes);
 
-    writer.writeStruct(std.coff.CoffHeader{
+    writer.writeStruct(std.coff.Header{
         .machine = machine_type,
         .number_of_sections = number_of_sections,
         .time_date_stamp = 0,
         .pointer_to_symbol_table = @intCast(pointer_to_symbol_table),
         .number_of_symbols = number_of_symbols,
         .size_of_optional_header = 0,
-        .flags = .{ .@"32BIT_MACHINE" = @intFromBool(!is64Bit(machine_type)) },
+        .flags = .{ .@"32BIT_MACHINE" = !is64Bit(machine_type) },
     }, .little) catch unreachable;
 
     writer.writeStruct(std.coff.SectionHeader{
@@ -746,9 +746,9 @@ fn getNullThunk(
                 .@"8BYTES"
             else
                 .@"4BYTES",
-            .CNT_INITIALIZED_DATA = 1,
-            .MEM_WRITE = 1,
-            .MEM_READ = 1,
+            .CNT_INITIALIZED_DATA = true,
+            .MEM_WRITE = true,
+            .MEM_READ = true,
         },
     }, .little) catch unreachable;
 
@@ -767,9 +767,9 @@ fn getNullThunk(
                 .@"8BYTES"
             else
                 .@"4BYTES",
-            .CNT_INITIALIZED_DATA = 1,
-            .MEM_WRITE = 1,
-            .MEM_READ = 1,
+            .CNT_INITIALIZED_DATA = true,
+            .MEM_WRITE = true,
+            .MEM_READ = true,
         },
     }, .little) catch unreachable;
 
@@ -813,7 +813,7 @@ fn getNullThunk(
 
 const WeakExternalOptions = struct {
     imp_prefix: bool,
-    machine_type: std.coff.MachineType,
+    machine_type: std.coff.IMAGE.FILE.MACHINE,
 };
 
 fn getWeakExternal(
@@ -826,7 +826,7 @@ fn getWeakExternal(
     const number_of_sections = 1;
     const number_of_symbols = 4;
     const number_of_weak_external_defs = 1;
-    const pointer_to_symbol_table = @sizeOf(std.coff.CoffHeader) +
+    const pointer_to_symbol_table = @sizeOf(std.coff.Header) +
         (@sizeOf(std.coff.SectionHeader) * number_of_sections);
 
     const symbol_names = try arena.alloc([]const u8, 2);
@@ -851,7 +851,7 @@ fn getWeakExternal(
     errdefer arena.free(bytes);
     var writer: std.Io.Writer = .fixed(bytes);
 
-    writer.writeStruct(std.coff.CoffHeader{
+    writer.writeStruct(std.coff.Header{
         .machine = options.machine_type,
         .number_of_sections = number_of_sections,
         .time_date_stamp = 0,
@@ -872,8 +872,8 @@ fn getWeakExternal(
         .number_of_relocations = 0,
         .number_of_linenumbers = 0,
         .flags = .{
-            .LNK_INFO = 1,
-            .LNK_REMOVE = 1,
+            .LNK_INFO = true,
+            .LNK_REMOVE = true,
         },
     }, .little) catch unreachable;
 
@@ -952,7 +952,7 @@ fn getShortImport(
     module_import_name: []const u8,
     sym: []const u8,
     export_name: ?[]const u8,
-    machine_type: std.coff.MachineType,
+    machine_type: std.coff.IMAGE.FILE.MACHINE,
     ordinal_hint: u16,
     import_type: std.coff.ImportType,
     name_type: std.coff.ImportNameType,
@@ -1032,13 +1032,13 @@ fn writeRelocation(writer: *std.Io.Writer, relocation: std.coff.Relocation) !voi
 }
 
 // https://learn.microsoft.com/en-us/windows/win32/debug/pe-format#type-indicators
-pub fn rvaRelocationTypeIndicator(target: std.coff.MachineType) ?u16 {
+pub fn rvaRelocationTypeIndicator(target: std.coff.IMAGE.FILE.MACHINE) ?u16 {
     return switch (target) {
-        .X64 => 0x3, // IMAGE_REL_AMD64_ADDR32NB
-        .I386 => 0x7, // IMAGE_REL_I386_DIR32NB
-        .ARMNT => 0x2, // IMAGE_REL_ARM_ADDR32NB
-        .ARM64, .ARM64EC, .ARM64X => 0x2, // IMAGE_REL_ARM64_ADDR32NB
-        .IA64 => 0x10, // IMAGE_REL_IA64_DIR32NB
+        .AMD64 => @intFromEnum(std.coff.IMAGE.REL.AMD64.ADDR32NB),
+        .I386 => @intFromEnum(std.coff.IMAGE.REL.I386.DIR32NB),
+        .ARMNT => @intFromEnum(std.coff.IMAGE.REL.ARM.ADDR32NB),
+        .ARM64, .ARM64EC, .ARM64X => @intFromEnum(std.coff.IMAGE.REL.ARM64.ADDR32NB),
+        .IA64 => @intFromEnum(std.coff.IMAGE.REL.IA64.DIR32NB),
         else => null,
     };
 }

@@ -17,9 +17,9 @@ pub fn main() !void {
     }
 
     const machine_type = machine_type: {
-        var machine_type: std.coff.MachineType = .X64;
+        var machine_type: std.coff.IMAGE.FILE.MACHINE = .AMD64;
         if (args.len >= 3) {
-            machine_type = std.meta.stringToEnum(std.coff.MachineType, args[2]) orelse {
+            machine_type = std.meta.stringToEnum(std.coff.IMAGE.FILE.MACHINE, args[2]) orelse {
                 std.debug.print("unknown or unsupported machine type: {s}\n", .{args[2]});
                 std.process.exit(1);
             };
@@ -58,7 +58,7 @@ pub fn main() !void {
     }
 }
 
-fn check(allocator: std.mem.Allocator, input: [:0]const u8, expected_output: []const u8, machine_type: std.coff.MachineType) !void {
+fn check(allocator: std.mem.Allocator, input: [:0]const u8, expected_output: []const u8, machine_type: std.coff.IMAGE.FILE.MACHINE) !void {
     var diagnostics: def.Diagnostics = undefined;
     var module_def = def.parse(allocator, input, machine_type, .mingw, &diagnostics) catch |err| switch (err) {
         error.OutOfMemory => |e| return e,

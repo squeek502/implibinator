@@ -17,9 +17,9 @@ pub fn main() !void {
     }
 
     const machine_type = machine_type: {
-        var machine_type: std.coff.MachineType = .X64;
+        var machine_type: std.coff.IMAGE.FILE.MACHINE = .AMD64;
         if (args.len >= 4) {
-            machine_type = std.meta.stringToEnum(std.coff.MachineType, args[3]) orelse {
+            machine_type = std.meta.stringToEnum(std.coff.IMAGE.FILE.MACHINE, args[3]) orelse {
                 std.debug.print("unknown or unsupported machine type: {s}\n", .{args[3]});
                 std.process.exit(1);
             };
