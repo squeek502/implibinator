@@ -1,8 +1,9 @@
 Module-Definition (.def) to Import Library (.lib) conversion (note: specifically MinGW .def files, at least for now).
 
-Once finished, intended to be upstreamed into the Zig compiler to close [#17807: ability to create import libs from def files without LLVM](https://github.com/ziglang/zig/issues/17807).
+Intended to be upstreamed into the Zig compiler to close [#17807: ability to create import libs from def files without LLVM](https://github.com/ziglang/zig/issues/17807).
 
-Work-in-progress.
+> [!NOTE]
+> This implementation [has been merged into Zig](https://github.com/ziglang/zig/pull/25414) and therefore this repository is now dormant. This repository may still see development in the future, though, since the infrastructure for exhaustive testing still exclusively exists here.
 
 Useful links:
 - https://learn.microsoft.com/en-us/cpp/build/reference/module-definition-dot-def-files?view=msvc-170
